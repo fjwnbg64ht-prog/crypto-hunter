@@ -20,19 +20,17 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
 # 策略第一拍過濾門檻
-MIN_OI_GROWTH_PCT = 1.2    # 5m持倉量增長 (%)
-MIN_RVOL = 2.0             # 成交量倍數 (RVOL)
-MIN_VOLATILITY_PCT = 0.5   # 5m波幅 (%)
+MIN_OI_GROWTH_PCT = 1.2      # 5m 持倉量增長門檻 (%)
+MIN_VOLATILITY_PCT = 0.5     # 5m 真實波幅門檻 (%)
+MIN_PRICE_CHANGE_PCT = 0.3   # 5m 實體漲跌幅門檻 (%)，防止上下影線雜訊
 
 # 防重複推播冷卻機制 (幣種: 上次觸發時間)
 ALERT_COOLDOWN = {}
-COOLDOWN_SECONDS = 300     # 同一標的 5 分鐘內不重複發送
+COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘內不重複發送
 
-# 週日大盤點評推播記錄
+# 推播日誌與覆盤紀錄
 LAST_SUNDAY_REPORT_DATE = ""
 LAST_DAILY_BACKTEST_DATE = ""
-
-# 自動覆盤記憶體資料庫
 TRACKED_SIGNALS = []
 
 # ==================== Health Check 服務器 ====================
@@ -41,7 +39,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (合約覆盤旗艦版) 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (方向精準防衝突版) 24H 雲端監控中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -182,13 +180,11 @@ def analyze_smc_snr(symbol):
 
 # ==================== 自動覆盤追蹤引擎 ====================
 def update_signal_outcomes():
-    """ 背景輪詢：檢測過去發出的訊號是否觸及 TP 或 SL """
     now_ts = time.time()
     for sig in TRACKED_SIGNALS:
         if sig["status"] != "PENDING":
             continue
         
-        # 超過 12 小時未打到，標記為過期
         if (now_ts - sig["created_at"]) > 43200:
             sig["status"] = "EXPIRED"
             continue
@@ -202,8 +198,6 @@ def update_signal_outcomes():
                 continue
 
             last_price = float(ticker_data.get("lastPrice", 0))
-            high_24h = float(ticker_data.get("highPrice24h", last_price))
-            low_24h = float(ticker_data.get("lowPrice24h", last_price))
 
             if sig["direction"] == "LONG":
                 if last_price >= sig["tp2"]:
@@ -224,15 +218,12 @@ def update_signal_outcomes():
             pass
 
 def check_and_send_daily_backtest_report():
-    """ 每天早上 08:00 自動推播過去 24 小時的策略覆盤勝率報告 """
     global LAST_DAILY_BACKTEST_DATE
     now_dt = get_taipei_now()
     today_date_str = now_dt.strftime("%Y-%m-%d")
 
-    # 每天 08:00 發送
     if now_dt.hour == 8 and LAST_DAILY_BACKTEST_DATE != today_date_str:
         if not TRACKED_SIGNALS:
-            print("📅 每日覆盤：暫無訊號記錄")
             LAST_DAILY_BACKTEST_DATE = today_date_str
             return
 
@@ -298,7 +289,7 @@ def check_and_send_sunday_report():
                 pass
         LAST_SUNDAY_REPORT_DATE = today_date_str
 
-# ==================== 單一標的掃描 (合約第一拍) ====================
+# ==================== 單一標的精準掃描 (已解決多空矛盾) ====================
 def inspect_symbol(ticker):
     symbol = ticker["symbol"]
     try:
@@ -306,73 +297,104 @@ def inspect_symbol(ticker):
         if symbol in ALERT_COOLDOWN and (now_time - ALERT_COOLDOWN[symbol]) < COOLDOWN_SECONDS:
             return
 
+        # 1. 抓取 OI 數據
         oi_url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=2"
-        vol_url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
-
         oi_res = requests.get(oi_url, timeout=3).json()
-        vol_res = requests.get(vol_url, timeout=3).json()
-
         oi_list = oi_res.get("result", {}).get("list", [])
-        ticker_data = vol_res.get("result", {}).get("list", [{}])[0]
-
-        if len(oi_list) < 2 or not ticker_data:
+        if len(oi_list) < 2:
             return
 
         oi_now = float(oi_list[0]["openInterest"])
         oi_prev = float(oi_list[1]["openInterest"])
-        oi_change_pct = ((oi_now - oi_prev) / oi_prev) * 100 if oi_prev > 0 else 0
+        if oi_prev <= 0:
+            return
 
-        last_price = float(ticker_data.get("lastPrice", 0))
-        high_price = float(ticker_data.get("highPrice24h", last_price))
-        low_price = float(ticker_data.get("lowPrice24h", last_price))
+        oi_change_pct = ((oi_now - oi_prev) / oi_prev) * 100
 
-        volatility_5m = ((high_price - low_price) / last_price) * 100 if last_price > 0 else 0
+        # 【核心修正 1】：持倉量必須是「正成長 (增倉)」！若持倉量減少代表主力平倉退場，直接過濾
+        if oi_change_pct < MIN_OI_GROWTH_PCT:
+            return
 
-        if abs(oi_change_pct) >= MIN_OI_GROWTH_PCT and volatility_5m >= MIN_VOLATILITY_PCT:
-            is_bullish = oi_change_pct > 0
-            direction_str = "LONG" if is_bullish else "SHORT"
-            direction_disp = "🟢 主力合約開多 (Bullish)" if is_bullish else "🔴 主力合約開空 (Bearish)"
-            
-            ALERT_COOLDOWN[symbol] = now_time
+        # 2. 抓取精準 5m K 線，計算真實價格漲跌幅與 5m 波幅
+        kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=2"
+        k_res = requests.get(kline_url, timeout=3).json()
+        klines = k_res.get("result", {}).get("list", [])
+        if not klines:
+            return
 
-            smc_snr = analyze_smc_snr(symbol)
-            fvg_text = smc_snr["fvg"] if smc_snr else "無"
-            ob_text = smc_snr["ob"] if smc_snr else "無"
-            snr_text = smc_snr["snr_status"] if smc_snr else "無"
-            sup_val = smc_snr["support"] if smc_snr else "N/A"
-            res_val = smc_snr["resistance"] if smc_snr else "N/A"
+        c0_open = float(klines[0][1])
+        c0_high = float(klines[0][2])
+        c0_low = float(klines[0][3])
+        c0_close = float(klines[0][4])
 
-            tf_views = get_multi_tf_views(symbol)
+        if c0_open <= 0:
+            return
 
-            reasons = [f"1. 5m OI 合約爆量卡位 {oi_change_pct:+.2f}%，主力資金入場"]
-            if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
-                reasons.append(f"2. SMC 失衡區 ({fvg_text})")
-            if "突破" in snr_text or "跌破" in snr_text:
-                reasons.append(f"3. SNR 突破關鍵結構 ({snr_text})")
-            
-            reason_str = "\n".join([f"• {r}" for r in reasons])
+        price_change_5m = ((c0_close - c0_open) / c0_open) * 100
+        volatility_5m = ((c0_high - c0_low) / c0_open) * 100
 
-            sl = round(last_price * 0.985, 4) if is_bullish else round(last_price * 1.015, 4)
-            tp1 = round(last_price * 1.020, 4) if is_bullish else round(last_price * 0.980, 4)
-            tp2 = round(last_price * 1.030, 4) if is_bullish else round(last_price * 0.970, 4)
+        # 波幅門檻過濾
+        if volatility_5m < MIN_VOLATILITY_PCT:
+            return
 
-            # 將發出的訊號放入覆盤資料庫
-            TRACKED_SIGNALS.append({
-                "symbol": symbol,
-                "direction": direction_str,
-                "entry_price": last_price,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "created_at": now_time,
-                "status": "PENDING"
-            })
+        # 【核心修正 2】：根據 5m 實體 K 線明確方向，徹底排除多空衝突
+        if price_change_5m >= MIN_PRICE_CHANGE_PCT:
+            is_bullish = True
+            direction_str = "LONG"
+            direction_disp = "🟢 主力合約開多 (Bullish)"
+        elif price_change_5m <= -MIN_PRICE_CHANGE_PCT:
+            is_bullish = False
+            direction_str = "SHORT"
+            direction_disp = "🔴 主力合約開空 (Bearish)"
+        else:
+            # 5m 實體漲跌幅未達到 0.3%（上下影線洗盤或無方向震盪），直接忽略
+            return
 
-            msg = f"""🚨 <b>【主力第一拍 + 多時框合約進場告警】</b>
+        # 觸發冷卻防護
+        ALERT_COOLDOWN[symbol] = now_time
+
+        # 3. 技術面與多時框分析
+        smc_snr = analyze_smc_snr(symbol)
+        fvg_text = smc_snr["fvg"] if smc_snr else "無"
+        ob_text = smc_snr["ob"] if smc_snr else "無"
+        snr_text = smc_snr["snr_status"] if smc_snr else "無"
+        sup_val = smc_snr["support"] if smc_snr else "N/A"
+        res_val = smc_snr["resistance"] if smc_snr else "N/A"
+
+        tf_views = get_multi_tf_views(symbol)
+
+        reasons = [
+            f"1. 5m OI 爆量增倉 {oi_change_pct:+.2f}%，主力資金主動建倉",
+            f"2. 5m K 線實體突破 {price_change_5m:+.2f}%，展現明確方向"
+        ]
+        if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
+            reasons.append(f"3. SMC 失衡區 ({fvg_text})")
+        if "突破" in snr_text or "跌破" in snr_text:
+            reasons.append(f"4. SNR 結構打破 ({snr_text})")
+
+        reason_str = "\n".join([f"• {r}" for r in reasons])
+
+        sl = round(c0_close * 0.985, 4) if is_bullish else round(c0_close * 1.015, 4)
+        tp1 = round(c0_close * 1.020, 4) if is_bullish else round(c0_close * 0.980, 4)
+        tp2 = round(c0_close * 1.030, 4) if is_bullish else round(c0_close * 0.970, 4)
+
+        # 將訊號寫入自動覆盤系統
+        TRACKED_SIGNALS.append({
+            "symbol": symbol,
+            "direction": direction_str,
+            "entry_price": c0_close,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "created_at": now_time,
+            "status": "PENDING"
+        })
+
+        msg = f"""🚨 <b>【主力第一拍 + 方向確定進場告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
 方向：<b>{direction_disp}</b>
-當前價格：<b>{last_price} USDT</b>
+當前價格：<b>{c0_close} USDT</b>
 
 💡 <b>【核心進場理由】</b>
 {reason_str}
@@ -387,8 +409,8 @@ def inspect_symbol(ticker):
 🛡️ <b>【合約風控參考】</b>
 • 止損 (SL)：<code>{sl}</code> | 目標1 (TP1)：<code>{tp1}</code> | 目標2 (TP2)：<code>{tp2}</code>"""
 
-            print(f"🔥 [合約訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 記錄至覆盤系統")
-            send_telegram_alert(msg)
+        print(f"🔥 [{direction_str} 訊號觸發] {symbol} | OI: {oi_change_pct:+.2f}% | 5m: {price_change_5m:+.2f}%")
+        send_telegram_alert(msg)
 
     except Exception:
         pass
@@ -396,16 +418,14 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 [合約覆盤旗艦版] 已啟動...")
+    print("⚡ 數據獵手 [精準防矛盾版] 已啟動...")
 
     while True:
         try:
-            # 1. 執行覆盤與大盤日報檢測
             update_signal_outcomes()
             check_and_send_daily_backtest_report()
             check_and_send_sunday_report()
 
-            # 2. 市場全盤掃描
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
             res = requests.get(url, timeout=5).json()
             tickers = res.get("result", {}).get("list", [])
