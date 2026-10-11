@@ -28,8 +28,12 @@ MIN_VOLATILITY_PCT = 0.5   # 5m波幅 (%)
 ALERT_COOLDOWN = {}
 COOLDOWN_SECONDS = 300     # 同一標的 5 分鐘內不重複發送
 
-# 週日大盤點評推播記錄 (防止重複發送)
+# 週日大盤點評推播記錄
 LAST_SUNDAY_REPORT_DATE = ""
+LAST_DAILY_BACKTEST_DATE = ""
+
+# 自動覆盤記憶體資料庫
+TRACKED_SIGNALS = []
 
 # ==================== Health Check 服務器 ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -37,7 +41,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (合約旗艦版) 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (合約覆盤旗艦版) 24H 雲端監控中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -47,7 +51,7 @@ def start_health_server():
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
-# ==================== Telegram 推播 (含診斷日誌) ====================
+# ==================== Telegram 推播 ====================
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN:
         print("⚠️ 未設定 TELEGRAM_BOT_TOKEN 環境變數！")
@@ -176,74 +180,122 @@ def analyze_smc_snr(symbol):
     except Exception:
         return None
 
-# ==================== 每週日 BTC/ETH 週報推播 ====================
+# ==================== 自動覆盤追蹤引擎 ====================
+def update_signal_outcomes():
+    """ 背景輪詢：檢測過去發出的訊號是否觸及 TP 或 SL """
+    now_ts = time.time()
+    for sig in TRACKED_SIGNALS:
+        if sig["status"] != "PENDING":
+            continue
+        
+        # 超過 12 小時未打到，標記為過期
+        if (now_ts - sig["created_at"]) > 43200:
+            sig["status"] = "EXPIRED"
+            continue
+
+        try:
+            symbol = sig["symbol"]
+            url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
+            res = requests.get(url, timeout=3).json()
+            ticker_data = res.get("result", {}).get("list", [{}])[0]
+            if not ticker_data:
+                continue
+
+            last_price = float(ticker_data.get("lastPrice", 0))
+            high_24h = float(ticker_data.get("highPrice24h", last_price))
+            low_24h = float(ticker_data.get("lowPrice24h", last_price))
+
+            if sig["direction"] == "LONG":
+                if last_price >= sig["tp2"]:
+                    sig["status"] = "WIN_TP2"
+                elif last_price >= sig["tp1"]:
+                    sig["status"] = "WIN_TP1"
+                elif last_price <= sig["sl"]:
+                    sig["status"] = "LOSS"
+            else: # SHORT
+                if last_price <= sig["tp2"]:
+                    sig["status"] = "WIN_TP2"
+                elif last_price <= sig["tp1"]:
+                    sig["status"] = "WIN_TP1"
+                elif last_price >= sig["sl"]:
+                    sig["status"] = "LOSS"
+
+        except Exception:
+            pass
+
+def check_and_send_daily_backtest_report():
+    """ 每天早上 08:00 自動推播過去 24 小時的策略覆盤勝率報告 """
+    global LAST_DAILY_BACKTEST_DATE
+    now_dt = get_taipei_now()
+    today_date_str = now_dt.strftime("%Y-%m-%d")
+
+    # 每天 08:00 發送
+    if now_dt.hour == 8 and LAST_DAILY_BACKTEST_DATE != today_date_str:
+        if not TRACKED_SIGNALS:
+            print("📅 每日覆盤：暫無訊號記錄")
+            LAST_DAILY_BACKTEST_DATE = today_date_str
+            return
+
+        total_cnt = len(TRACKED_SIGNALS)
+        tp1_cnt = sum(1 for s in TRACKED_SIGNALS if s["status"] in ["WIN_TP1", "WIN_TP2"])
+        tp2_cnt = sum(1 for s in TRACKED_SIGNALS if s["status"] == "WIN_TP2")
+        loss_cnt = sum(1 for s in TRACKED_SIGNALS if s["status"] == "LOSS")
+        pending_cnt = sum(1 for s in TRACKED_SIGNALS if s["status"] == "PENDING")
+
+        completed_cnt = tp1_cnt + loss_cnt
+        win_rate = (tp1_cnt / completed_cnt * 100) if completed_cnt > 0 else 0.0
+
+        msg = f"""📈 <b>【數據獵手 24H 策略自動覆盤戰報】</b>
+
+📅 統計日期：<code>{today_date_str}</code>
+
+📊 <b>【整體績效統計】</b>
+• 總觸發訊號數：<b>{total_cnt} 筆</b>
+• TP1 目標命中：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• TP2 大獲全勝：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• SL 觸及止損：<b>{loss_cnt} 筆</b>
+• 進行中 / 震盪：<b>{pending_cnt} 筆</b>
+
+🎯 <b>【勝率評估】</b>
+• 已平倉訊號勝率：<b>{win_rate:.1f}%</b>
+
+💡 <i>系統持續 24H 自動記錄，協助建立完全客觀的交易紀律與數據複盤！</i>"""
+
+        send_telegram_alert(msg)
+        LAST_DAILY_BACKTEST_DATE = today_date_str
+
+# ==================== 週日 BTC/ETH 大盤週報 ====================
 def check_and_send_sunday_report():
     global LAST_SUNDAY_REPORT_DATE
     now_dt = get_taipei_now()
     today_date_str = now_dt.strftime("%Y-%m-%d")
 
-    # 檢查是否為週日 (weekday 6) 且今天尚未推播過
     if now_dt.weekday() == 6 and LAST_SUNDAY_REPORT_DATE != today_date_str:
-        print(f"📅 [{get_taipei_now_str()}] 開始發送週日 BTC / ETH 合約週報與支撐壓力分析...")
-        
         targets = [("BTCUSDT", "比特幣"), ("ETHUSDT", "以太坊")]
-        
         for symbol, name in targets:
             try:
                 tf_views = get_multi_tf_views(symbol)
                 smc_snr = analyze_smc_snr(symbol)
+                if not smc_snr: continue
 
-                if not smc_snr:
-                    continue
-
-                last_price = smc_snr["last_price"]
-                sup_val = smc_snr["support"]
-                res_val = smc_snr["resistance"]
-                fvg_text = smc_snr["fvg"]
-                ob_text = smc_snr["ob"]
-                snr_status = smc_snr["snr_status"]
-
-                daily_tf = tf_views.get("日線", "")
-                h4_tf = tf_views.get("4小時", "")
-                h1_tf = tf_views.get("1小時", "")
-
-                if "多頭" in daily_tf or "多頭" in h4_tf:
-                    overall_bias = "🟢 大時框偏多（建議回踩關鍵支撐找低多機會）"
-                elif "空頭" in daily_tf or "空頭" in h4_tf:
-                    overall_bias = "🔴 大時框偏空（建議反彈關鍵壓力找高空機會）"
-                else:
-                    overall_bias = "🟡 大時框震盪（關注高低點突破方向）"
-
-                report_msg = f"""📊 <b>【每週日主流幣合約週報與結構分析】</b>
+                report_msg = f"""📊 <b>【每週日主流幣合約週報】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> ({name} 永續合約)
-當前價格：<b>{last_price} USDT</b>
+當前價格：<b>{smc_snr['last_price']} USDT</b>
 
-🎯 <b>【關鍵支撐與壓力位】</b>
-• <b>強壓力位 (Resistance)</b>：<code>{res_val}</code>
-• <b>強支撐位 (Support)</b>：<code>{sup_val}</code>
-• <b>目前結構狀態</b>：{snr_status}
+🎯 <b>【關鍵結構】</b>
+• 強壓力位：<code>{smc_snr['resistance']}</code>
+• 強支撐位：<code>{smc_snr['support']}</code>
+• SMC FVG：{smc_snr['fvg']}
+• SMC OB：{smc_snr['ob']}
 
-🧠 <b>【SMC 聰明錢結構】</b>
-• SMC FVG 失衡區：{fvg_text}
-• SMC OB 訂單塊：{ob_text}
-
-🌐 <b>【多時框趨勢觀點】</b>
-• 5 分鐘：{tf_views.get('5分', 'N/A')}
-• 15 分鐘：{tf_views.get('15分', 'N/A')}
-• 1 小時：{h1_tf}
-• 4 小時：{h4_tf}
-• 日線：{daily_tf}
-
-💡 <b>【週度合約策略建議】</b>
-{overall_bias}
-⚠️ <i>請嚴格執行合約資金管理，建議槓桿不超過 10-20x 並預設 Stop Loss！</i>"""
+🌐 <b>【大時框趨勢】</b>
+• 1小時：{tf_views.get('1小時', 'N/A')} | 4小時：{tf_views.get('4小時', 'N/A')} | 日線：{tf_views.get('日線', 'N/A')}"""
 
                 send_telegram_alert(report_msg)
                 time.sleep(2)
-            except Exception as e:
-                print(f"❌ 週日週報 {symbol} 發送失敗: {e}")
-
+            except Exception:
+                pass
         LAST_SUNDAY_REPORT_DATE = today_date_str
 
 # ==================== 單一標的掃描 (合約第一拍) ====================
@@ -251,7 +303,6 @@ def inspect_symbol(ticker):
     symbol = ticker["symbol"]
     try:
         now_time = time.time()
-        # 冷卻機制檢查
         if symbol in ALERT_COOLDOWN and (now_time - ALERT_COOLDOWN[symbol]) < COOLDOWN_SECONDS:
             return
 
@@ -277,15 +328,13 @@ def inspect_symbol(ticker):
 
         volatility_5m = ((high_price - low_price) / last_price) * 100 if last_price > 0 else 0
 
-        # 第一拍條件過濾
         if abs(oi_change_pct) >= MIN_OI_GROWTH_PCT and volatility_5m >= MIN_VOLATILITY_PCT:
             is_bullish = oi_change_pct > 0
-            direction = "🟢 主力合約開多 (Bullish)" if is_bullish else "🔴 主力合約開空 (Bearish)"
+            direction_str = "LONG" if is_bullish else "SHORT"
+            direction_disp = "🟢 主力合約開多 (Bullish)" if is_bullish else "🔴 主力合約開空 (Bearish)"
             
-            # 更新冷卻時間
             ALERT_COOLDOWN[symbol] = now_time
 
-            # SMC & SNR 分析
             smc_snr = analyze_smc_snr(symbol)
             fvg_text = smc_snr["fvg"] if smc_snr else "無"
             ob_text = smc_snr["ob"] if smc_snr else "無"
@@ -293,58 +342,52 @@ def inspect_symbol(ticker):
             sup_val = smc_snr["support"] if smc_snr else "N/A"
             res_val = smc_snr["resistance"] if smc_snr else "N/A"
 
-            # 多時框觀點
             tf_views = get_multi_tf_views(symbol)
 
-            # 整理進場理由
-            reasons = [f"1. 5m OI 合約爆量卡位 {oi_change_pct:+.2f}%，主力合約資金入場"]
+            reasons = [f"1. 5m OI 合約爆量卡位 {oi_change_pct:+.2f}%，主力資金入場"]
             if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
-                reasons.append(f"2. SMC 留下失衡區 ({fvg_text})")
+                reasons.append(f"2. SMC 失衡區 ({fvg_text})")
             if "突破" in snr_text or "跌破" in snr_text:
                 reasons.append(f"3. SNR 突破關鍵結構 ({snr_text})")
             
-            higher_tf_bull = "多頭" in tf_views.get("1小時", "") or "多頭" in tf_views.get("4小時", "")
-            if is_bullish and higher_tf_bull:
-                reasons.append("4. 順應 1h/4h 大時框多頭主趨勢")
-            elif not is_bullish and not higher_tf_bull:
-                reasons.append("4. 順應 1h/4h 大時框空頭主趨勢")
-            
             reason_str = "\n".join([f"• {r}" for r in reasons])
 
-            # 風控建議 (針對永續合約)
             sl = round(last_price * 0.985, 4) if is_bullish else round(last_price * 1.015, 4)
             tp1 = round(last_price * 1.020, 4) if is_bullish else round(last_price * 0.980, 4)
             tp2 = round(last_price * 1.030, 4) if is_bullish else round(last_price * 0.970, 4)
 
-            # 訊息內容 (合約專用)
+            # 將發出的訊號放入覆盤資料庫
+            TRACKED_SIGNALS.append({
+                "symbol": symbol,
+                "direction": direction_str,
+                "entry_price": last_price,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "created_at": now_time,
+                "status": "PENDING"
+            })
+
             msg = f"""🚨 <b>【主力第一拍 + 多時框合約進場告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>{direction}</b>
+方向：<b>{direction_disp}</b>
 當前價格：<b>{last_price} USDT</b>
 
 💡 <b>【核心進場理由】</b>
 {reason_str}
 
 🌐 <b>【多時框趨勢觀點】</b>
-• 5 分鐘：{tf_views.get('5分', 'N/A')}
-• 15 分鐘：{tf_views.get('15分', 'N/A')}
-• 1 小時：{tf_views.get('1小時', 'N/A')}
-• 4 小時：{tf_views.get('4小時', 'N/A')}
-• 日線：{tf_views.get('日線', 'N/A')}
+• 5m: {tf_views.get('5分', 'N/A')} | 15m: {tf_views.get('15分', 'N/A')} | 1h: {tf_views.get('1小時', 'N/A')} | 4h: {tf_views.get('4小時', 'N/A')} | 日線: {tf_views.get('日線', 'N/A')}
 
 🎯 <b>【SMC & SNR 結構】</b>
-• SMC FVG 失衡區：{fvg_text}
-• SMC OB 訂單塊：{ob_text}
-• SNR 支撐壓力：{snr_text}
+• FVG: {fvg_text} | OB: {ob_text} | 狀態: {snr_text}
 • 阻力 / 支撐：<code>{res_val}</code> / <code>{sup_val}</code>
 
 🛡️ <b>【合約風控參考】</b>
-• 止損 (SL)：<code>{sl}</code>
-• 目標 1 (TP1)：<code>{tp1}</code> | 目標 2 (TP2)：<code>{tp2}</code>
-⚠️ <i>請依照個人合約倉位嚴格執行止損！</i>"""
+• 止損 (SL)：<code>{sl}</code> | 目標1 (TP1)：<code>{tp1}</code> | 目標2 (TP2)：<code>{tp2}</code>"""
 
-            print(f"🔥 [合約訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 開始發送 Telegram...")
+            print(f"🔥 [合約訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 記錄至覆盤系統")
             send_telegram_alert(msg)
 
     except Exception:
@@ -353,21 +396,23 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 [合約旗艦版] 已啟動...")
+    print("⚡ 數據獵手 [合約覆盤旗艦版] 已啟動...")
 
     while True:
         try:
-            # 檢查並觸發週日 BTC/ETH 大盤推播
+            # 1. 執行覆盤與大盤日報檢測
+            update_signal_outcomes()
+            check_and_send_daily_backtest_report()
             check_and_send_sunday_report()
 
+            # 2. 市場全盤掃描
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
             res = requests.get(url, timeout=5).json()
             tickers = res.get("result", {}).get("list", [])
-
             tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
 
             now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 併發掃描 50 個永續合約標的 (多時框 + SMC + SNR)...")
+            print(f"[{now_str}] 🔍 併發掃描 50 個永續合約標的...")
 
             with ThreadPoolExecutor(max_workers=10) as executor:
                 executor.map(inspect_symbol, tickers)
