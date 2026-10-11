@@ -2,11 +2,18 @@ import os
 import time
 import requests
 import threading
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ==================== 設定區 ====================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8950040592:AAHxroakCFWjDKHkIkSpBBd8H4ii_XaMD78")
+# ==================== 時區設定 (台灣時間 UTC+8) ====================
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+def get_taipei_now_str():
+    return datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+
+# ==================== 設定區 (純環境變數，完全不含明文 Token) ====================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
 # 策略第一拍過濾門檻
@@ -37,7 +44,7 @@ def start_health_server():
 # ==================== Telegram 推播 (含診斷日誌) ====================
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN:
-        print("⚠️ 未設定 TELEGRAM_BOT_TOKEN！")
+        print("⚠️ 未設定 TELEGRAM_BOT_TOKEN 環境變數！")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -278,7 +285,7 @@ def run_formal_hunter():
 
             tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
 
-            now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            now_str = get_taipei_now_str()
             print(f"[{now_str}] 🔍 併發掃描 50 個標的 (多時框 + SMC + SNR)...")
 
             with ThreadPoolExecutor(max_workers=10) as executor:
