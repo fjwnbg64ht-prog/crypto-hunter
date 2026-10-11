@@ -9,10 +9,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ==================== 時區設定 (台灣時間 UTC+8) ====================
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-def get_taipei_now_str():
-    return datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+def get_taipei_now():
+    return datetime.now(TZ_TAIPEI)
 
-# ==================== 設定區 (純環境變數，完全不含明文 Token) ====================
+def get_taipei_now_str():
+    return get_taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ==================== 設定區 (純環境變數，完全無明文 Token) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
@@ -25,13 +28,16 @@ MIN_VOLATILITY_PCT = 0.5   # 5m波幅 (%)
 ALERT_COOLDOWN = {}
 COOLDOWN_SECONDS = 300     # 同一標的 5 分鐘內不重複發送
 
+# 週日大盤點評推播記錄 (防止重複發送)
+LAST_SUNDAY_REPORT_DATE = ""
+
 # ==================== Health Check 服務器 ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (旗艦穩定版) 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (合約旗艦版) 24H 雲端監控中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -140,7 +146,7 @@ def analyze_smc_snr(symbol):
         elif c0_close < c1_low and c1_close > c1_open:
             ob_signal = f"📦 跌破空頭 OB ({c1_low}~{c1_high})"
 
-        # 3. SNR: 20K Pivot
+        # 3. SNR: Pivot
         past_highs = [float(k[2]) for k in klines[1:21]]
         past_lows = [float(k[3]) for k in klines[1:21]]
         resistance = max(past_highs)
@@ -148,9 +154,9 @@ def analyze_smc_snr(symbol):
 
         snr_status = "區間內震盪"
         if c0_close >= resistance:
-            snr_status = f"🚀 突破 20K 壓力 ({resistance})"
+            snr_status = f"🚀 突破關鍵壓力 ({resistance})"
         elif c0_close <= support:
-            snr_status = f"💥 跌破 20K 支撐 ({support})"
+            snr_status = f"💥 跌破關鍵支撐 ({support})"
         else:
             near_res_pct = abs(c0_close - resistance) / c0_close * 100
             near_sup_pct = abs(c0_close - support) / c0_close * 100
@@ -164,12 +170,83 @@ def analyze_smc_snr(symbol):
             "ob": ob_signal,
             "snr_status": snr_status,
             "support": support,
-            "resistance": resistance
+            "resistance": resistance,
+            "last_price": c0_close
         }
     except Exception:
         return None
 
-# ==================== 單一標的掃描 ====================
+# ==================== 每週日 BTC/ETH 週報推播 ====================
+def check_and_send_sunday_report():
+    global LAST_SUNDAY_REPORT_DATE
+    now_dt = get_taipei_now()
+    today_date_str = now_dt.strftime("%Y-%m-%d")
+
+    # 檢查是否為週日 (weekday 6) 且今天尚未推播過
+    if now_dt.weekday() == 6 and LAST_SUNDAY_REPORT_DATE != today_date_str:
+        print(f"📅 [{get_taipei_now_str()}] 開始發送週日 BTC / ETH 合約週報與支撐壓力分析...")
+        
+        targets = [("BTCUSDT", "比特幣"), ("ETHUSDT", "以太坊")]
+        
+        for symbol, name in targets:
+            try:
+                tf_views = get_multi_tf_views(symbol)
+                smc_snr = analyze_smc_snr(symbol)
+
+                if not smc_snr:
+                    continue
+
+                last_price = smc_snr["last_price"]
+                sup_val = smc_snr["support"]
+                res_val = smc_snr["resistance"]
+                fvg_text = smc_snr["fvg"]
+                ob_text = smc_snr["ob"]
+                snr_status = smc_snr["snr_status"]
+
+                daily_tf = tf_views.get("日線", "")
+                h4_tf = tf_views.get("4小時", "")
+                h1_tf = tf_views.get("1小時", "")
+
+                if "多頭" in daily_tf or "多頭" in h4_tf:
+                    overall_bias = "🟢 大時框偏多（建議回踩關鍵支撐找低多機會）"
+                elif "空頭" in daily_tf or "空頭" in h4_tf:
+                    overall_bias = "🔴 大時框偏空（建議反彈關鍵壓力找高空機會）"
+                else:
+                    overall_bias = "🟡 大時框震盪（關注高低點突破方向）"
+
+                report_msg = f"""📊 <b>【每週日主流幣合約週報與結構分析】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> ({name} 永續合約)
+當前價格：<b>{last_price} USDT</b>
+
+🎯 <b>【關鍵支撐與壓力位】</b>
+• <b>強壓力位 (Resistance)</b>：<code>{res_val}</code>
+• <b>強支撐位 (Support)</b>：<code>{sup_val}</code>
+• <b>目前結構狀態</b>：{snr_status}
+
+🧠 <b>【SMC 聰明錢結構】</b>
+• SMC FVG 失衡區：{fvg_text}
+• SMC OB 訂單塊：{ob_text}
+
+🌐 <b>【多時框趨勢觀點】</b>
+• 5 分鐘：{tf_views.get('5分', 'N/A')}
+• 15 分鐘：{tf_views.get('15分', 'N/A')}
+• 1 小時：{h1_tf}
+• 4 小時：{h4_tf}
+• 日線：{daily_tf}
+
+💡 <b>【週度合約策略建議】</b>
+{overall_bias}
+⚠️ <i>請嚴格執行合約資金管理，建議槓桿不超過 10-20x 並預設 Stop Loss！</i>"""
+
+                send_telegram_alert(report_msg)
+                time.sleep(2)
+            except Exception as e:
+                print(f"❌ 週日週報 {symbol} 發送失敗: {e}")
+
+        LAST_SUNDAY_REPORT_DATE = today_date_str
+
+# ==================== 單一標的掃描 (合約第一拍) ====================
 def inspect_symbol(ticker):
     symbol = ticker["symbol"]
     try:
@@ -203,7 +280,7 @@ def inspect_symbol(ticker):
         # 第一拍條件過濾
         if abs(oi_change_pct) >= MIN_OI_GROWTH_PCT and volatility_5m >= MIN_VOLATILITY_PCT:
             is_bullish = oi_change_pct > 0
-            direction = "🟢 主力開多 (Bullish)" if is_bullish else "🔴 主力開空 (Bearish)"
+            direction = "🟢 主力合約開多 (Bullish)" if is_bullish else "🔴 主力合約開空 (Bearish)"
             
             # 更新冷卻時間
             ALERT_COOLDOWN[symbol] = now_time
@@ -220,7 +297,7 @@ def inspect_symbol(ticker):
             tf_views = get_multi_tf_views(symbol)
 
             # 整理進場理由
-            reasons = [f"1. 5m OI 爆量卡位 {oi_change_pct:+.2f}%，主力資金入場"]
+            reasons = [f"1. 5m OI 合約爆量卡位 {oi_change_pct:+.2f}%，主力合約資金入場"]
             if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
                 reasons.append(f"2. SMC 留下失衡區 ({fvg_text})")
             if "突破" in snr_text or "跌破" in snr_text:
@@ -234,17 +311,17 @@ def inspect_symbol(ticker):
             
             reason_str = "\n".join([f"• {r}" for r in reasons])
 
-            # 風控建議
+            # 風控建議 (針對永續合約)
             sl = round(last_price * 0.985, 4) if is_bullish else round(last_price * 1.015, 4)
             tp1 = round(last_price * 1.020, 4) if is_bullish else round(last_price * 0.980, 4)
             tp2 = round(last_price * 1.030, 4) if is_bullish else round(last_price * 0.970, 4)
 
-            # 訊息內容
-            msg = f"""🚨 <b>【主力第一拍 + 多時框進場告警】</b>
+            # 訊息內容 (合約專用)
+            msg = f"""🚨 <b>【主力第一拍 + 多時框合約進場告警】</b>
 
-📌 <b>標的</b>：<code>{symbol}</code>
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
 方向：<b>{direction}</b>
-當前價格：<b>{last_price}</b>
+當前價格：<b>{last_price} USDT</b>
 
 💡 <b>【核心進場理由】</b>
 {reason_str}
@@ -262,11 +339,12 @@ def inspect_symbol(ticker):
 • SNR 支撐壓力：{snr_text}
 • 阻力 / 支撐：<code>{res_val}</code> / <code>{sup_val}</code>
 
-🛡️ <b>【風控參考】</b>
+🛡️ <b>【合約風控參考】</b>
 • 止損 (SL)：<code>{sl}</code>
-• 目標 1 (TP1)：<code>{tp1}</code> | 目標 2 (TP2)：<code>{tp2}</code>"""
+• 目標 1 (TP1)：<code>{tp1}</code> | 目標 2 (TP2)：<code>{tp2}</code>
+⚠️ <i>請依照個人合約倉位嚴格執行止損！</i>"""
 
-            print(f"🔥 [訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 開始發送 Telegram...")
+            print(f"🔥 [合約訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 開始發送 Telegram...")
             send_telegram_alert(msg)
 
     except Exception:
@@ -275,26 +353,13 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 [旗艦穩定版] 已啟動...")
+    print("⚡ 數據獵手 [合約旗艦版] 已啟動...")
 
     while True:
         try:
+            # 檢查並觸發週日 BTC/ETH 大盤推播
+            check_and_send_sunday_report()
+
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
             res = requests.get(url, timeout=5).json()
             tickers = res.get("result", {}).get("list", [])
-
-            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
-
-            now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 併發掃描 50 個標的 (多時框 + SMC + SNR)...")
-
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                executor.map(inspect_symbol, tickers)
-
-        except Exception as e:
-            print(f"掃描異常: {e}")
-
-        time.sleep(15)
-
-if __name__ == "__main__":
-    run_formal_hunter()
