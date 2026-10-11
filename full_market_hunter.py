@@ -363,3 +363,19 @@ def run_formal_hunter():
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
             res = requests.get(url, timeout=5).json()
             tickers = res.get("result", {}).get("list", [])
+
+            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
+
+            now_str = get_taipei_now_str()
+            print(f"[{now_str}] 🔍 併發掃描 50 個永續合約標的 (多時框 + SMC + SNR)...")
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                executor.map(inspect_symbol, tickers)
+
+        except Exception as e:
+            print(f"掃描異常: {e}")
+
+        time.sleep(15)
+
+if __name__ == "__main__":
+    run_formal_hunter()
