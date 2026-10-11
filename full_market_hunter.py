@@ -187,4 +187,107 @@ def inspect_symbol(ticker):
         oi_prev = float(oi_list[1]["openInterest"])
         oi_change_pct = ((oi_now - oi_prev) / oi_prev) * 100 if oi_prev > 0 else 0
 
-        last_price = float(ticker_data.get("
+        last_price = float(ticker_data.get("lastPrice", 0))
+        high_price = float(ticker_data.get("highPrice24h", last_price))
+        low_price = float(ticker_data.get("lowPrice24h", last_price))
+
+        volatility_5m = ((high_price - low_price) / last_price) * 100 if last_price > 0 else 0
+
+        # 第一拍條件過濾
+        if abs(oi_change_pct) >= MIN_OI_GROWTH_PCT and volatility_5m >= MIN_VOLATILITY_PCT:
+            is_bullish = oi_change_pct > 0
+            direction = "🟢 主力開多 (Bullish)" if is_bullish else "🔴 主力開空 (Bearish)"
+            
+            # 更新冷卻時間
+            ALERT_COOLDOWN[symbol] = now_time
+
+            # SMC & SNR 分析
+            smc_snr = analyze_smc_snr(symbol)
+            fvg_text = smc_snr["fvg"] if smc_snr else "無"
+            ob_text = smc_snr["ob"] if smc_snr else "無"
+            snr_text = smc_snr["snr_status"] if smc_snr else "無"
+            sup_val = smc_snr["support"] if smc_snr else "N/A"
+            res_val = smc_snr["resistance"] if smc_snr else "N/A"
+
+            # 多時框觀點
+            tf_views = get_multi_tf_views(symbol)
+
+            # 整理進場理由
+            reasons = [f"1. 5m OI 爆量卡位 {oi_change_pct:+.2f}%，主力資金入場"]
+            if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
+                reasons.append(f"2. SMC 留下失衡區 ({fvg_text})")
+            if "突破" in snr_text or "跌破" in snr_text:
+                reasons.append(f"3. SNR 突破關鍵結構 ({snr_text})")
+            
+            higher_tf_bull = "多頭" in tf_views.get("1小時", "") or "多頭" in tf_views.get("4小時", "")
+            if is_bullish and higher_tf_bull:
+                reasons.append("4. 順應 1h/4h 大時框多頭主趨勢")
+            elif not is_bullish and not higher_tf_bull:
+                reasons.append("4. 順應 1h/4h 大時框空頭主趨勢")
+            
+            reason_str = "\n".join([f"• {r}" for r in reasons])
+
+            # 風控建議
+            sl = round(last_price * 0.985, 4) if is_bullish else round(last_price * 1.015, 4)
+            tp1 = round(last_price * 1.020, 4) if is_bullish else round(last_price * 0.980, 4)
+            tp2 = round(last_price * 1.030, 4) if is_bullish else round(last_price * 0.970, 4)
+
+            # 訊息內容
+            msg = f"""🚨 <b>【主力第一拍 + 多時框進場告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code>
+方向：<b>{direction}</b>
+當前價格：<b>{last_price}</b>
+
+💡 <b>【核心進場理由】</b>
+{reason_str}
+
+🌐 <b>【多時框趨勢觀點】</b>
+• 5 分鐘：{tf_views.get('5分', 'N/A')}
+• 15 分鐘：{tf_views.get('15分', 'N/A')}
+• 1 小時：{tf_views.get('1小時', 'N/A')}
+• 4 小時：{tf_views.get('4小時', 'N/A')}
+• 日線：{tf_views.get('日線', 'N/A')}
+
+🎯 <b>【SMC & SNR 結構】</b>
+• SMC FVG 失衡區：{fvg_text}
+• SMC OB 訂單塊：{ob_text}
+• SNR 支撐壓力：{snr_text}
+• 阻力 / 支撐：<code>{res_val}</code> / <code>{sup_val}</code>
+
+🛡️ <b>【風控參考】</b>
+• 止損 (SL)：<code>{sl}</code>
+• 目標 1 (TP1)：<code>{tp1}</code> | 目標 2 (TP2)：<code>{tp2}</code>"""
+
+            print(f"🔥 [訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 開始發送 Telegram...")
+            send_telegram_alert(msg)
+
+    except Exception:
+        pass
+
+# ==================== 主監控循環 ====================
+def run_formal_hunter():
+    threading.Thread(target=start_health_server, daemon=True).start()
+    print("⚡ 數據獵手 [旗艦穩定版] 已啟動...")
+
+    while True:
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear"
+            res = requests.get(url, timeout=5).json()
+            tickers = res.get("result", {}).get("list", [])
+
+            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
+
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"[{now_str}] 🔍 併發掃描 50 個標的 (多時框 + SMC + SNR)...")
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                executor.map(inspect_symbol, tickers)
+
+        except Exception as e:
+            print(f"掃描異常: {e}")
+
+        time.sleep(15)
+
+if __name__ == "__main__":
+    run_formal_hunter()
