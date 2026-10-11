@@ -1,214 +1,287 @@
 import os
 import time
-import threading
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ================= 第一拍大資金捕捉參數 =================
-TELEGRAM_BOT_TOKEN = "8716746659:AAEZzTH-mPNA5U7iApmL3sXazS2S1IvF5iU"
-TELEGRAM_CHAT_ID = "6132673542"
+# ==================== 設定區 ====================
+TELEGRAM_BOT_TOKEN = "7832628631:AAEE_1IvF5iU"  # 你的 Telegram Bot Token
+TELEGRAM_CHAT_ID = "1879133649"         # 你的 Telegram Chat ID
 
-MIN_24H_TURNOVER = 5_000_000   # 過濾 24H 成交額 < 500萬 USDT 的低流動性幣種
-TOP_CANDIDATES_LIMIT = 50      # 取成交量前 50 名最活躍標的進行精細監控
+# 策略第一拍過濾門檻
+MIN_OI_GROWTH_PCT = 1.2    # 5m持倉量增長 (%)
+MIN_RVOL = 2.0             # 成交量倍數 (RVOL)
+MIN_VOLATILITY_PCT = 0.5   # 5m波幅 (%)
 
-OI_GROWTH_THRESHOLD = 1.2      # 5m OI (未平倉量) 增幅 > 1.2%
-RVOL_THRESHOLD = 2.0           # 5m 成交量 > 過去20期平均 2.0 倍
-PRICE_CHANGE_THRESHOLD = 0.5   # 5m 價格波幅 > 0.5%
-
-CHECK_INTERVAL = 15            # 15 秒高頻輪詢
-MAX_WORKERS = 10               # 併發線程數
-# =======================================================
-
-BYBIT_BASE = "https://api.bybit.com"
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json"
-})
-
-# 啟動輕量背景 Web Server 應對 Render 健康檢查
+# ==================== Health Check 服務器 ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (全時框+SMC+SNR 旗艦版) 24H 雲端監控中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
 
 def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
-def get_tw_time():
-    tw_tz = timezone(timedelta(hours=8))
-    return datetime.now(tw_tz).strftime('%Y-%m-%d %H:%M:%S')
-
-def fmt_p(p):
-    if p >= 100: return f"{p:.2f}"
-    if p >= 1: return f"{p:.4f}"
-    return f"{p:.6f}"
-
+# ==================== Telegram 推播 ====================
 def send_telegram_alert(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ 未設定 Telegram Token 或 Chat ID")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
+        "parse_mode": "HTML"
     }
     try:
-        session.post(url, json=payload, timeout=3)
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"❌ Telegram 推播失敗: {e}")
+        print(f"Telegram 發送失敗: {e}")
 
-def get_all_active_symbols():
-    url = f"{BYBIT_BASE}/v5/market/tickers?category=linear"
+# ==================== 多時框 (Multi-Timeframe) 趨勢分析 ====================
+def get_multi_tf_views(symbol):
+    """
+    抓取 5m, 15m, 1h, 4h, 1D 級別的 K 線，進行均線與 K 線結構趨勢判斷
+    """
+    tf_configs = [
+        ('5', '5分'),
+        ('15', '15分'),
+        ('60', '1小時'),
+        ('240', '4小時'),
+        ('D', '日線')
+    ]
+    views = {}
+    
+    for interval, label in tf_configs:
+        try:
+            url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=15"
+            res = requests.get(url, timeout=2.5).json()
+            klines = res.get("result", {}).get("list", [])
+            
+            if len(klines) >= 10:
+                c0_close = float(klines[0][4])
+                c0_open = float(klines[0][1])
+                closes = [float(k[4]) for k in klines]
+                ma = sum(closes) / len(closes)
+
+                if c0_close > ma and c0_close >= c0_open:
+                    views[label] = "🟢 多頭強勢"
+                elif c0_close < ma and c0_close <= c0_open:
+                    views[label] = "🔴 空頭強勢"
+                elif c0_close > ma:
+                    views[label] = "📈 偏多震盪"
+                else:
+                    views[label] = "📉 偏空震盪"
+            else:
+                views[label] = "⚪ 數據不足"
+        except Exception:
+            views[label] = "⚪ 讀取失敗"
+            
+    return views
+
+# ==================== SMC 與 SNR 技術指標分析 ====================
+def analyze_smc_snr(symbol):
+    """
+    抓取 5m K線數據分析 SMC (FVG/OB) 與 SNR (關鍵支撐壓力)
+    """
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=30"
     try:
-        resp = session.get(url, timeout=5)
-        if resp.status_code != 200: return []
-        data = resp.json()
-        if data.get('retCode') != 0: return []
+        resp = requests.get(url, timeout=3).json()
+        if resp.get("retCode") != 0 or not resp.get("result", {}).get("list"):
+            return None
         
-        ticker_list = data.get('result', {}).get('list', [])
-        valid_items = [
-            item for item in ticker_list
-            if isinstance(item, dict)
-            and item.get('symbol', '').endswith('USDT')
-            and float(item.get('turnover24h', 0)) >= MIN_24H_TURNOVER
-        ]
-        
-        valid_items.sort(key=lambda x: float(x.get('turnover24h', 0)), reverse=True)
-        return [item['symbol'] for item in valid_items[:TOP_CANDIDATES_LIMIT]]
-    except Exception as e:
-        print(f"❌ 獲取全市場清單失敗: {e}")
-        return []
-
-def analyze_symbol(symbol):
-    try:
-        kline_url = f"{BYBIT_BASE}/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=21"
-        resp = session.get(kline_url, timeout=3)
-        if resp.status_code != 200: return None
-        
-        klines = resp.json().get('result', {}).get('list', [])
-        if not isinstance(klines, list) or len(klines) < 21: return None
-        
-        vols = [float(k[5]) for k in klines[1:]]
-        curr_vol = float(klines[0][5])
-        avg_vol = sum(vols) / len(vols) if len(vols) > 0 else 1
-        rvol = curr_vol / avg_vol if avg_vol > 0 else 0
-        
-        open_p = float(klines[0][1])
-        close_p = float(klines[0][4])
-        price_change = ((close_p - open_p) / open_p) * 100
-
-        if rvol < RVOL_THRESHOLD or abs(price_change) < PRICE_CHANGE_THRESHOLD:
+        klines = resp["result"]["list"]
+        if len(klines) < 20:
             return None
 
-        oi_url = f"{BYBIT_BASE}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=2"
-        oi_resp = session.get(oi_url, timeout=3)
-        if oi_resp.status_code != 200: return None
+        c0_high = float(klines[0][2])
+        c0_low = float(klines[0][3])
+        c0_close = float(klines[0][4])
         
-        oi_list = oi_resp.json().get('result', {}).get('list', [])
-        if not isinstance(oi_list, list) or len(oi_list) < 2: return None
+        c1_open = float(klines[1][1])
+        c1_high = float(klines[1][2])
+        c1_low = float(klines[1][3])
+        c1_close = float(klines[1][4])
         
-        curr_oi = float(oi_list[0]['openInterest'])
-        prev_oi = float(oi_list[1]['openInterest'])
-        if prev_oi <= 0: return None
-        oi_change = ((curr_oi - prev_oi) / prev_oi) * 100
+        c2_high = float(klines[2][2])
+        c2_low = float(klines[2][3])
 
-        if oi_change >= OI_GROWTH_THRESHOLD:
-            if price_change > 0:
-                direction_tag = "🟢 偏多確認 (LONG)"
-                sl = close_p * (1 - 0.015)
-                tp1 = close_p * (1 + 0.020)
-                tp2 = close_p * (1 + 0.030)
-                tp3 = close_p * (1 + 0.040)
-            else:
-                direction_tag = "🔴 偏空確認 (SHORT)"
-                sl = close_p * (1 + 0.015)
-                tp1 = close_p * (1 - 0.020)
-                tp2 = close_p * (1 - 0.030)
-                tp3 = close_p * (1 - 0.040)
+        # 1. SMC: FVG (Fair Value Gap / 失衡區)
+        fvg_signal = "無顯著 FVG"
+        if c0_low > c2_high:
+            gap_pct = round(((c0_low - c2_high) / c2_high) * 100, 2)
+            fvg_signal = f"🟢 看漲 FVG (+{gap_pct}%)"
+        elif c0_high < c2_low:
+            gap_pct = round(((c2_low - c0_high) / c2_low) * 100, 2)
+            fvg_signal = f"🔴 看跌 FVG (-{gap_pct}%)"
 
-            highs = [float(k[2]) for k in klines[1:]]
-            lows = [float(k[3]) for k in klines[1:]]
+        # 2. SMC: OB (Order Block / 訂單塊區域)
+        ob_signal = "一般區域"
+        if c0_close > c1_high and c1_close < c1_open:
+            ob_signal = f"📦 突破多頭 OB ({c1_low}~{c1_high})"
+        elif c0_close < c1_low and c1_close > c1_open:
+            ob_signal = f"📦 跌破空頭 OB ({c1_low}~{c1_high})"
 
-            return {
-                'symbol': symbol,
-                'direction': direction_tag,
-                'entry_price': close_p,
-                'price_change': price_change,
-                'rvol': rvol,
-                'oi_change': oi_change,
-                'sl': sl,
-                'tp1': tp1,
-                'tp2': tp2,
-                'tp3': tp3,
-                'resistance': max(highs),
-                'support': min(lows)
-            }
-    except:
+        # 3. SNR: 關鍵支撐壓力位 (20 根 5m K線 Pivot)
+        past_highs = [float(k[2]) for k in klines[1:21]]
+        past_lows = [float(k[3]) for k in klines[1:21]]
+        resistance = max(past_highs)
+        support = min(past_lows)
+
+        snr_status = "區間內震盪"
+        if c0_close >= resistance:
+            snr_status = f"🚀 突破 20K 關鍵壓力 ({resistance})"
+        elif c0_close <= support:
+            snr_status = f"💥 跌破 20K 關鍵支撐 ({support})"
+        else:
+            near_res_pct = abs(c0_close - resistance) / c0_close * 100
+            near_sup_pct = abs(c0_close - support) / c0_close * 100
+            if near_res_pct < 0.3:
+                snr_status = f"⚠️ 逼近壓力位 ({resistance})"
+            elif near_sup_pct < 0.3:
+                snr_status = f"🛡️ 逼近支撐位 ({support})"
+
+        return {
+            "fvg": fvg_signal,
+            "ob": ob_signal,
+            "snr_status": snr_status,
+            "support": support,
+            "resistance": resistance
+        }
+    except Exception:
+        return None
+
+# ==================== 單一標的掃描 ====================
+def inspect_symbol(ticker):
+    symbol = ticker["symbol"]
+    try:
+        oi_url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=2"
+        vol_url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
+
+        oi_res = requests.get(oi_url, timeout=3).json()
+        vol_res = requests.get(vol_url, timeout=3).json()
+
+        oi_list = oi_res.get("result", {}).get("list", [])
+        ticker_data = vol_res.get("result", {}).get("list", [{}])[0]
+
+        if len(oi_list) < 2 or not ticker_data:
+            return
+
+        # 核心數據計算
+        oi_now = float(oi_list[0]["openInterest"])
+        oi_prev = float(oi_list[1]["openInterest"])
+        oi_change_pct = ((oi_now - oi_prev) / oi_prev) * 100 if oi_prev > 0 else 0
+
+        last_price = float(ticker_data.get("lastPrice", 0))
+        high_price = float(ticker_data.get("highPrice24h", last_price))
+        low_price = float(ticker_data.get("lowPrice24h", last_price))
+        turnover_24h = float(ticker_data.get("turnover24h", 0))
+
+        volatility_5m = ((high_price - low_price) / last_price) * 100 if last_price > 0 else 0
+
+        # 第一拍條件過濾
+        if abs(oi_change_pct) >= MIN_OI_GROWTH_PCT and volatility_5m >= MIN_VOLATILITY_PCT:
+            is_bullish = oi_change_pct > 0
+            direction = "🟢 主力開多 (Bullish)" if is_bullish else "🔴 主力開空 (Bearish)"
+            
+            # 1. 深入分析 SMC 與 SNR
+            smc_snr = analyze_smc_snr(symbol)
+            fvg_text = smc_snr["fvg"] if smc_snr else "無"
+            ob_text = smc_snr["ob"] if smc_snr else "無"
+            snr_text = smc_snr["snr_status"] if smc_snr else "無"
+            sup_val = smc_snr["support"] if smc_snr else "N/A"
+            res_val = smc_snr["resistance"] if smc_snr else "N/A"
+
+            # 2. 深入分析多時框觀點 (5m, 15m, 1h, 4h, 1D)
+            tf_views = get_multi_tf_views(symbol)
+
+            # 3. 整理【進場理由】
+            reasons = []
+            reasons.append(f"1. 5m OI 爆量卡位 {oi_change_pct:+.2f}%，主力資金入場")
+            if "看漲 FVG" in fvg_text or "看跌 FVG" in fvg_text:
+                reasons.append(f"2. SMC 留下失衡區 ({fvg_text})")
+            if "突破" in snr_text or "跌破" in snr_text:
+                reasons.append(f"3. SNR 突破關鍵結構 ({snr_text})")
+            
+            # 檢查大時框同向共振
+            higher_tf_bull = "多頭" in tf_views.get("1小時", "") or "多頭" in tf_views.get("4小時", "")
+            if is_bullish and higher_tf_bull:
+                reasons.append("4. 順應 1h/4h 大時框多頭主趨勢（高勝率共振）")
+            elif not is_bullish and not higher_tf_bull:
+                reasons.append("4. 順應 1h/4h 大時框空頭主趨勢（高勝率共振）")
+            
+            reason_str = "\n".join([f"• {r}" for r in reasons])
+
+            # 4. 風控建議 (止損 1.5%, 止盈 2.0% / 3.0%)
+            sl = round(last_price * 0.985, 4) if is_bullish else round(last_price * 1.015, 4)
+            tp1 = round(last_price * 1.020, 4) if is_bullish else round(last_price * 0.980, 4)
+            tp2 = round(last_price * 1.030, 4) if is_bullish else round(last_price * 0.970, 4)
+
+            # 構建 Telegram 訊息
+            msg = f"""
+🚨 <b>【主力第一拍 + 多時框進場告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code>
+方向：<b>{direction}</b>
+當前價格：<b>{last_price}</b>
+
+💡 <b>【核心進場理由】</b>
+{reason_str}
+
+🌐 <b>【多時框趨勢觀點】</b>
+• 5 分鐘：<b>{tf_views.get('5分', 'N/A')}</b>
+• 15 分鐘：<b>{tf_views.get('15分', 'N/A')}</b>
+• 1 小時：<b>{tf_views.get('1小時', 'N/A')}</b>
+• 4 小時：<b>{tf_views.get('4小時', 'N/A')}</b>
+• 日線：<b>{tf_views.get('日線', 'N/A')}</b>
+
+🎯 <b>【SMC & SNR 結構】</b>
+• SMC FVG 失衡區：<b>{fvg_text}</b>
+• SMC OB 訂單塊：<b>{ob_text}</b>
+• SNR 支撐壓力：<b>{snr_text}</b>
+• 關鍵阻力 / 支撐：<code>{res_val}</code> / <code>{sup_val}</code>
+
+🛡️ <b>【風控參考】</b>
+• 止損 (SL)：<code>{sl}</code>
+• 目標 1 (TP1)：<code>{tp1}</code> | 目標 2 (TP2)：<code>{tp2}</code>
+            """
+            print(f"🔥 [訊號觸發] {symbol} | OI: {oi_change_pct:.2f}% | 理由: {reasons[0]}")
+            send_telegram_alert(msg)
+
+    except Exception:
         pass
-    return None
 
+# ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    
-    print("⚡ 數據獵手 [Render Web 實戰版] 已啟動...")
-    print("⚙️ 風控目標：SL 1.5% | TP1 2.0% | TP2 3.0% | TP3 4.0%")
-    print(f"📌 第一拍門檻：5m OI > {OI_GROWTH_THRESHOLD}% | RVOL > {RVOL_THRESHOLD}x | 5m 波幅 > {PRICE_CHANGE_THRESHOLD}%\n")
-    
+    print("⚡ 數據獵手 [全時框+SMC+SNR 旗艦版] 已啟動...")
+
     while True:
-        symbols = get_all_active_symbols()
-        now_str = get_tw_time()
-        print(f"[{now_str}] 🔍 正在併發掃描熱門標的 {len(symbols)} 個...")
-        
-        triggered_results = []
-        if symbols:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_symbol = {executor.submit(analyze_symbol, s): s for s in symbols}
-                for future in as_completed(future_to_symbol):
-                    res = future.result()
-                    if res: triggered_results.append(res)
-        
-        if triggered_results:
-            print(f"\n🎯 [{now_str}] 發現 {len(triggered_results)} 個【第一拍大資金流入】標的！")
-            triggered_results.sort(key=lambda x: x['oi_change'], reverse=True)
-            
-            for item in triggered_results:
-                alert_msg = (
-                    f"⚡ **[數據獵手 - 第一拍大資金入場]** ⚡\n"
-                    f"📌 **標的**: `{item['symbol']}`\n"
-                    f"🧭 **訊號方向**: `{item['direction']}`\n"
-                    f"💵 **建議進場價**: `{fmt_p(item['entry_price'])}` USDT\n"
-                    f"----------------------------\n"
-                    f"📈 **5m OI 增幅**: `{item['oi_change']:+.2f}%` 🚨 (主力第一拍進場)\n"
-                    f"📊 **5m 爆量倍數**: `{item['rvol']:.2f}x` RVOL\n"
-                    f"⚡ **5m 價格波幅**: `{item['price_change']:+.2f}%`\n"
-                    f"----------------------------\n"
-                    f"🎯 **止盈規劃 (TP)**:\n"
-                    f"  • TP1 (2.0%): `{fmt_p(item['tp1'])}`\n"
-                    f"  • TP2 (3.0%): `{fmt_p(item['tp2'])}`\n"
-                    f"  • TP3 (4.0%): `{fmt_p(item['tp3'])}` \n\n"
-                    f"🛡 **止損規劃 (SL)**:\n"
-                    f"  • SL  (1.5%): `{fmt_p(item['sl'])}`\n\n"
-                    f"📍 **5m/20期 結構位**:\n"
-                    f"  • 近期壓力 (R): `{fmt_p(item['resistance'])}`\n"
-                    f"  • 近期支撐 (S): `{fmt_p(item['support'])}`\n"
-                    f"----------------------------\n"
-                    f"🔗 [Bybit 交易](https://www.bybit.com/trade/usdt/{item['symbol']})"
-                )
-                send_telegram_alert(alert_msg)
-        else:
-            print(f"💤 [{now_str}] 掃描完畢，暫無大資金第一拍進場標的。")
-            
-        time.sleep(CHECK_INTERVAL)
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear"
+            res = requests.get(url, timeout=5).json()
+            tickers = res.get("result", {}).get("list", [])
+
+            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
+
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"[{now_str}] 🔍 併發掃描 50 個標的 (多時框 + SMC + SNR)...")
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                executor.map(inspect_symbol, tickers)
+
+        except Exception as e:
+            print(f"掃描異常: {e}")
+
+        time.sleep(15)
 
 if __name__ == "__main__":
     run_formal_hunter()
