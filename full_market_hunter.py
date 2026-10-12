@@ -15,7 +15,7 @@ def get_taipei_now():
 def get_taipei_now_str():
     return get_taipei_now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ==================== 價格動態格式化 (解決小數點精度問題) ====================
+# ==================== 價格動態格式化 ====================
 def format_price(val):
     if val is None or val == "N/A":
         return "N/A"
@@ -32,7 +32,7 @@ def format_price(val):
     except Exception:
         return str(val)
 
-# ==================== EMA 指數移動平均線計算 ====================
+# ==================== EMA 計算 ====================
 def calculate_ema(closes, period):
     if len(closes) < period:
         return None
@@ -43,7 +43,7 @@ def calculate_ema(closes, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# ==================== 設定區 (Martin 策略 + $100 風控 1.0% TG 監控) ====================
+# ==================== 設定區 (AVWAP 觸發專用 + $100 風控 1.0%) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
@@ -61,7 +61,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (Martin 回調買入法 $100風控旗艦版) 運行中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (AVWAP 觸發告警旗艦版) 運行中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -120,9 +120,9 @@ def get_multi_tf_views(symbol):
             views[label] = "⚪ 讀取失敗"
     return views
 
-# ==================== Martin 第一步與第二步：日線選強與 AVWAP/EMA 支撐 ====================
+# ==================== Martin 步驟一與二：日線選強與階段高點 AVWAP 計算 ====================
 def analyze_martin_daily_setup(symbol):
-    """ 抓取日線資料，計算 9/21/50 EMA 與階段高點 AVWAP 共振位 """
+    """ 抓取日線資料，精確計算階段高點 AVWAP 與 21 EMA 支撐位 """
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=D&limit=60"
     try:
         resp = requests.get(url, timeout=3.5).json()
@@ -141,38 +141,38 @@ def analyze_martin_daily_setup(symbol):
         c_30d_ago = closes[-30]
         momentum_30d = ((c_now - c_30d_ago) / c_30d_ago) * 100
 
-        # 1. 篩選強勢：30日內漲幅顯著
-        if momentum_30d < 15.0:
+        # 1. 篩選強勢標的 (近30日動能)
+        if momentum_30d < 12.0:
             return None
 
         ema9 = calculate_ema(closes, 9)
         ema21 = calculate_ema(closes, 21)
         ema50 = calculate_ema(closes, 50)
 
-        # 2. 回調低點抬高 (Higher Lows) 檢測
+        # 2. 回調低點抬高 (Higher Lows)
         recent_lows = lows[-10:]
         is_higher_lows = recent_lows[-1] >= recent_lows[0]
 
-        # 3. 尋找近 30 日最高點，計算 AVWAP
+        # 3. 尋找近 30 日最高點，精確計算 AVWAP
         recent_30_highs = highs[-30:]
         peak_high = max(recent_30_highs)
         peak_idx = recent_30_highs.index(peak_high) + (len(highs) - 30)
 
-        # 從 peak_idx 開始計算 AVWAP
         pv_sum = sum((highs[i] + lows[i] + closes[i]) / 3 * volumes[i] for i in range(peak_idx, len(highs)))
         vol_sum = sum(volumes[i] for i in range(peak_idx, len(highs)))
         avwap_val = (pv_sum / vol_sum) if vol_sum > 0 else c_now
 
-        # 4. 判斷價格是否接近 21 EMA 或 AVWAP 支撐區 (2.5% 內)
-        near_ema21 = abs(c_now - ema21) / c_now <= 0.025
-        near_avwap = abs(c_now - avwap_val) / c_now <= 0.025
+        # 4. 判斷價格是否落在 AVWAP 或 21 EMA 支撐區 (2.5% 範圍內)
+        dist_avwap_pct = abs(c_now - avwap_val) / c_now * 100
+        dist_ema21_pct = abs(c_now - ema21) / c_now * 100
 
-        if is_higher_lows and (near_ema21 or near_avwap or c_now >= ema21 * 0.98):
+        if is_higher_lows and (dist_avwap_pct <= 2.5 or dist_ema21_pct <= 2.5 or c_now >= ema21 * 0.98):
             return {
                 "ema9": ema9,
                 "ema21": ema21,
                 "ema50": ema50,
                 "avwap": avwap_val,
+                "dist_avwap_pct": dist_avwap_pct,
                 "peak_high": peak_high,
                 "support_zone": min(ema21, avwap_val)
             }
@@ -209,15 +209,15 @@ def update_signal_outcomes():
                 if last_price <= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
                     sl_reasons = [
-                        "1. <b>關鍵支撐跌破</b>：價格跌破 Martin 日線 AVWAP 與 21 EMA 重疊支撐位",
-                        "2. <b>微結構假突破</b>：5m 突破前高後遭遇賣壓，未能守住突破陽線低點",
+                        "1. <b>AVWAP 支撐跌破</b>：價格實體向下跌破階段高點 AVWAP 防守線",
+                        "2. <b>微結構突破失敗</b>：5m 突破前高後缺乏買盤跟進，未能守住突破陽線低點",
                         "3. <b>大盤聯動急洗</b>：大盤短線快速下挫，貫穿 -2.0% 防守位"
                     ]
                     reason_text = "\n".join([f"• {r}" for r in sl_reasons])
-                    loss_msg = f"""❌ <b>【Martin 策略 - 單筆止損告警】</b>
+                    loss_msg = f"""❌ <b>【AVWAP 策略 - 單筆止損告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 多頭回調買入</b>
+方向：<b>🟢 AVWAP 回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
 
@@ -227,14 +227,14 @@ def update_signal_outcomes():
 ⚠️ <i>已觸發 -2.0% 紀律止損，嚴格控管 $100 風險！</i>"""
                     send_telegram_alert(loss_msg)
 
-                # TP3 (+4.0% / 2R)
+                # TP3 (+4.0%)
                 elif last_price >= sig["tp3"] and sig["notified_tp"] < 3:
                     sig["status"] = "WIN_TP3"
                     sig["notified_tp"] = 3
-                    tp3_msg = f"""🚀 <b>【Martin 策略 - TP3 滿盈離場告警】</b>
+                    tp3_msg = f"""🚀 <b>【AVWAP 策略 - TP3 滿盈離場告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 多頭回調買入</b>
+方向：<b>🟢 AVWAP 回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
 
@@ -245,10 +245,10 @@ def update_signal_outcomes():
                 elif last_price >= sig["tp2"] and sig["notified_tp"] < 2:
                     sig["status"] = "WIN_TP2"
                     sig["notified_tp"] = 2
-                    tp2_msg = f"""🎯 <b>【Martin 策略 - TP2 達標告警】</b>
+                    tp2_msg = f"""🎯 <b>【AVWAP 策略 - TP2 達標告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 多頭回調買入</b>
+方向：<b>🟢 AVWAP 回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
 
@@ -259,10 +259,10 @@ def update_signal_outcomes():
                 elif last_price >= sig["tp1"] and sig["notified_tp"] < 1:
                     sig["status"] = "WIN_TP1"
                     sig["notified_tp"] = 1
-                    tp1_msg = f"""✅ <b>【Martin 策略 - TP1 達標告警】</b>
+                    tp1_msg = f"""✅ <b>【AVWAP 策略 - TP1 達標告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 多頭回調買入</b>
+方向：<b>🟢 AVWAP 回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
 
@@ -272,28 +272,19 @@ def update_signal_outcomes():
             else: # SHORT
                 if last_price >= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
-                    loss_msg = f"""❌ <b>【Martin 策略 - 單筆止損告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🔴 空頭回調開空</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
-
-⚠️ <i>觸及 -2.0% 止損位，請執行紀律離場！</i>"""
-                    send_telegram_alert(loss_msg)
-
+                    send_telegram_alert(f"❌ <b>【AVWAP 策略】</b> <code>{symbol}</code> 觸及 -2.0% 止損！")
                 elif last_price <= sig["tp3"] and sig["notified_tp"] < 3:
                     sig["status"] = "WIN_TP3"
                     sig["notified_tp"] = 3
-                    send_telegram_alert(f"🚀 <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP3 (+4.0%) 滿盈離場！")
+                    send_telegram_alert(f"🚀 <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP3 (+4.0%) 滿盈離場！")
                 elif last_price <= sig["tp2"] and sig["notified_tp"] < 2:
                     sig["status"] = "WIN_TP2"
                     sig["notified_tp"] = 2
-                    send_telegram_alert(f"🎯 <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP2 (+3.0%)！")
+                    send_telegram_alert(f"🎯 <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP2 (+3.0%)！")
                 elif last_price <= sig["tp1"] and sig["notified_tp"] < 1:
                     sig["status"] = "WIN_TP1"
                     sig["notified_tp"] = 1
-                    send_telegram_alert(f"✅ <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP1 (+2.0%)！建議保本平半倉！")
+                    send_telegram_alert(f"✅ <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP1 (+2.0%)！建議保本平半倉！")
 
         except Exception:
             pass
@@ -318,7 +309,7 @@ def check_and_send_daily_backtest_report():
         completed_cnt = tp1_cnt + loss_cnt
         win_rate = (tp1_cnt / completed_cnt * 100) if completed_cnt > 0 else 0.0
 
-        msg = f"""📈 <b>【Martin 回調買入法 - 24H 實盤戰報】</b>
+        msg = f"""📈 <b>【AVWAP 回調買入法 - 24H 實盤戰報】</b>
 
 📅 統計日期：<code>{today_date_str}</code>
 
@@ -333,7 +324,7 @@ def check_and_send_daily_backtest_report():
 🎯 <b>【實盤勝率】</b>
 • 策略勝率 (TP1 達標率)：<b>{win_rate:.1f}%</b> (目標 80%)
 
-💡 <i>嚴格遵照 Martin 4步驟：選強 + AVWAP共振 + 5m突破 + 1.0%風控算手數！</i>"""
+💡 <i>專注 AVWAP 機構成本支撐共振 + 5m 微結構突破 + $100 固定風控！</i>"""
 
         send_telegram_alert(msg)
         LAST_DAILY_BACKTEST_DATE = today_date_str
@@ -352,15 +343,14 @@ def check_and_send_sunday_report():
                 m_setup = analyze_martin_daily_setup(symbol)
                 if not m_setup: continue
 
-                report_msg = f"""📊 <b>【每週日 Martin 策略主流幣大盤點評】</b>
+                report_msg = f"""📊 <b>【每週日 AVWAP 策略主流幣大盤點評】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> ({name} 永續合約)
 
-🎯 <b>【日線關鍵共振支撐】</b>
-• 9 EMA：<code>{format_price(m_setup['ema9'])}</code>
-• 21 EMA：<code>{format_price(m_setup['ema21'])}</code>
-• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code>
-• 強支撐重疊區：<code>{format_price(m_setup['support_zone'])}</code>
+🎯 <b>【日線 AVWAP 與均線支撐】</b>
+• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code> (距離 {m_setup['dist_avwap_pct']:.2f}%)
+• 21 EMA：<code>{format_price(m_setup['ema21'])}</code> | 9 EMA：<code>{format_price(m_setup['ema9'])}</code>
+• 關鍵支撐區：<code>{format_price(m_setup['support_zone'])}</code>
 
 🌐 <b>【多時框趨勢】</b>
 • 1小時：{tf_views.get('1小時', 'N/A')} | 4小時：{tf_views.get('4小時', 'N/A')} | 日線：{tf_views.get('日線', 'N/A')}"""
@@ -371,7 +361,7 @@ def check_and_send_sunday_report():
                 pass
         LAST_SUNDAY_REPORT_DATE = today_date_str
 
-# ==================== 單一標的 Martin 打法掃描 (5m 微結構突破) ====================
+# ==================== 單一標的 AVWAP 觸發掃描 (5m 微結構突破) ====================
 def inspect_symbol(ticker):
     symbol = ticker["symbol"]
     try:
@@ -393,12 +383,15 @@ def inspect_symbol(ticker):
         if oi_change_pct < MIN_OI_GROWTH_PCT:
             return
 
-        # 2. Martin 步驟一與二：日線選強與 AVWAP / 21 EMA 支撐重疊
+        # 2. 檢測 AVWAP 日線層面支撐區
         m_setup = analyze_martin_daily_setup(symbol)
         if not m_setup:
             return
 
-        # 3. Martin 步驟三：5分鐘微結構突破 (Micro Breakout)
+        avwap_val = m_setup["avwap"]
+        dist_avwap_pct = m_setup["dist_avwap_pct"]
+
+        # 3. 檢測 5m 微結構突破 (Micro Breakout)
         kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=3"
         k_res = requests.get(kline_url, timeout=3).json()
         klines = k_res.get("result", {}).get("list", [])
@@ -412,14 +405,13 @@ def inspect_symbol(ticker):
         c1_high = float(klines[1][2])
         c1_low = float(klines[1][3])
 
-        # 條件：當前 5m 收盤突破前一根 5m High (微結構發動)
+        # 條件：5m 收盤價強勢突破前一根 5m High (微結構突破確立)
         is_micro_breakout = c0_close > c1_high
-
         if not is_micro_breakout:
             return
 
         direction_str = "LONG"
-        direction_disp = "🟢 Martin 多頭回調買入 (Bullish)"
+        direction_disp = "🟢 AVWAP 支撐共振 + 多頭突破 (Bullish)"
 
         # 4. 多時框趨勢過濾 (1h/4h 不能是強空)
         tf_views = get_multi_tf_views(symbol)
@@ -437,17 +429,17 @@ def inspect_symbol(ticker):
         tp2_val = c0_close * 1.030
         tp3_val = c0_close * 1.040
 
-        # 計算 Martin 1.0% 帳戶風控倉位 (假設 $10,000 帳戶單筆固定虧損 $100)
-        account_risk_100 = 100.0  # $10,000 * 1.0%
+        # 計算 Martin 1.0% 帳戶風控倉位 ($10,000 帳戶單筆固定虧損 $100)
+        account_risk_100 = 100.0
         per_unit_risk = abs(c0_close - sl_val)
         position_units = account_risk_100 / per_unit_risk if per_unit_risk > 0 else 0
         position_value = position_units * c0_close
 
         reasons = [
-            f"1. <b>日線強勢選股</b>：30日動能強勁，低點抬高 (Higher Lows)",
-            f"2. <b>關鍵支撐重疊</b>：價格落在日線 21 EMA ({format_price(m_setup['ema21'])}) 與階段高點 AVWAP ({format_price(m_setup['avwap'])}) 附近",
-            f"3. <b>5m 微結構突破</b>：收盤價格 ({format_price(c0_close)}) 強勢突破前一根 5m 最高價 ({format_price(c1_high)})",
-            f"4. <b>主力資金卡位</b>：5m 持倉量 (OI) 暴增 {oi_change_pct:+.2f}%"
+            f"1. <b>🎯 AVWAP 關鍵支撐觸發</b>：價格精準回測階段高點 AVWAP 成本線 (距離僅 {dist_avwap_pct:.2f}%)",
+            f"2. <b>⚡ 5m 微結構發動</b>：收盤價 ({format_price(c0_close)}) 強勢突破前一根 5m K 線最高價 ({format_price(c1_high)})",
+            f"3. <b>📈 日線強勢結構</b>：30日漲幅顯著，回調低點持續抬高 (Higher Lows)",
+            f"4. <b>🔥 5m 持倉量爆量</b>：OI 增長 {oi_change_pct:+.2f}%，機構資金同步進場"
         ]
         reason_str = "\n".join([f"• {r}" for r in reasons])
 
@@ -465,7 +457,7 @@ def inspect_symbol(ticker):
             "notified_tp": 0
         })
 
-        msg = f"""🚨 <b>【Martin 回調買入法 + 微結構觸發告警】</b>
+        msg = f"""🚨 <b>【🎯 AVWAP 關鍵支撐 + 5m 微結構觸發告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
 方向：<b>{direction_disp}</b>
@@ -474,21 +466,21 @@ def inspect_symbol(ticker):
 💡 <b>【核心進場理由】</b>
 {reason_str}
 
-🎯 <b>【日線關鍵重疊位】</b>
-• 9 EMA：<code>{format_price(m_setup['ema9'])}</code> | 21 EMA：<code>{format_price(m_setup['ema21'])}</code>
-• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code>
+🎯 <b>【關鍵支撐價位】</b>
+• <b>階段高點 AVWAP</b>：<code>{format_price(avwap_val)}</code>
+• <b>日線 21 EMA</b>：<code>{format_price(m_setup['ema21'])}</code>
 
 🌐 <b>【多時框趨勢觀點】</b>
 • 5m: {tf_views.get('5分', 'N/A')} | 15m: {tf_views.get('15分', 'N/A')} | 1h: {h1_tf} | 4h: {h4_tf}
 
-🛡️ <b>【實盤風控與 Martin 1.0% 倉位建議】</b>
+🛡️ <b>【實盤風控與 $100 倉位建議】</b>
 • <b>止損 (SL -2.0%)</b>：<code>{format_price(sl_val)}</code>
 • <b>目標 1 (TP1 +2.0%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
 • <b>目標 2 (TP2 +3.0%)</b>：<code>{format_price(tp2_val)}</code>
 • <b>目標 3 (TP3 +4.0%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)
 • <b>$10k 帳戶建倉參考</b>：約投入 <b>{position_value:.1f} USDT</b> (固定風控 $100 / 1.0%)"""
 
-        print(f"🔥 [Martin 訊號觸發] {symbol} | OI: {oi_change_pct:+.2f}% | 風控 $100")
+        print(f"🔥 [AVWAP 觸發訊號] {symbol} | AVWAP: {format_price(avwap_val)} | 風控 $100")
         send_telegram_alert(msg)
 
     except Exception:
@@ -497,7 +489,7 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 (Martin 回調買入法 $100風控旗艦版) 已啟動...")
+    print("⚡ 數據獵手 (AVWAP 觸發告警旗艦版) 已啟動...")
 
     while True:
         try:
@@ -511,7 +503,7 @@ def run_formal_hunter():
             tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
 
             now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 Martin 策略併發掃描 50 個合約標的...")
+            print(f"[{now_str}] 🔍 AVWAP 策略併發掃描 50 個合約標的...")
 
             with ThreadPoolExecutor(max_workers=10) as executor:
                 executor.map(inspect_symbol, tickers)
