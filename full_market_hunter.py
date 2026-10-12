@@ -15,7 +15,7 @@ def get_taipei_now():
 def get_taipei_now_str():
     return get_taipei_now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ==================== 價格動態格式化 ====================
+# ==================== 價格動態格式化 (解決小數點精度問題) ====================
 def format_price(val):
     if val is None or val == "N/A":
         return "N/A"
@@ -43,20 +43,14 @@ def calculate_ema(closes, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# ==================== 設定區 (實盤 10-15單/日 + 2%SL含原因診斷 / 2%3%4%TP) ====================
+# ==================== 設定區 (Martin 策略 + $100 風控 1.0% TG 監控) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
-# 實盤發單頻率調校 (目標每日 10-15 筆高品質單)
-MIN_OI_GROWTH_PCT = 1.5      # 5m 持倉量暴增門檻 1.5%
-MIN_VOLATILITY_PCT = 0.6     # 5m 真實波幅門檻 0.6%
-MIN_PRICE_CHANGE_PCT = 0.4   # 5m 實體 K 線突破門檻 0.4%
-
-# 防重複推播冷卻機制
+MIN_OI_GROWTH_PCT = 1.2      # 5m 持倉量增長門檻 1.2%
 ALERT_COOLDOWN = {}
-COOLDOWN_SECONDS = 600       # 同一標的 10 分鐘內不重複發送
+COOLDOWN_SECONDS = 600       # 同一標的 10 分鐘內不重複推播
 
-# 覆盤與推播紀錄
 LAST_SUNDAY_REPORT_DATE = ""
 LAST_DAILY_BACKTEST_DATE = ""
 TRACKED_SIGNALS = []
@@ -67,7 +61,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (止損原因診斷版) 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (Martin 回調買入法 $100風控旗艦版) 運行中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -98,29 +92,20 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"❌ Telegram 連線異常: {e}")
 
-# ==================== 多時框 (Multi-Timeframe) 趨勢分析 ====================
+# ==================== 多時框 (MTF) 趨勢分析 ====================
 def get_multi_tf_views(symbol):
-    tf_configs = [
-        ('5', '5分'),
-        ('15', '15分'),
-        ('60', '1小時'),
-        ('240', '4小時'),
-        ('D', '日線')
-    ]
+    tf_configs = [('5', '5分'), ('15', '15分'), ('60', '1小時'), ('240', '4小時'), ('D', '日線')]
     views = {}
-    
     for interval, label in tf_configs:
         try:
             url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=15"
             res = requests.get(url, timeout=2.5).json()
             klines = res.get("result", {}).get("list", [])
-            
             if len(klines) >= 10:
                 c0_close = float(klines[0][4])
                 c0_open = float(klines[0][1])
                 closes = [float(k[4]) for k in klines]
                 ma = sum(closes) / len(closes)
-
                 if c0_close > ma and c0_close >= c0_open:
                     views[label] = "🟢 多頭強勢"
                 elif c0_close < ma and c0_close <= c0_open:
@@ -133,82 +118,69 @@ def get_multi_tf_views(symbol):
                 views[label] = "⚪ 數據不足"
         except Exception:
             views[label] = "⚪ 讀取失敗"
-            
     return views
 
-# ==================== EMA 均線與 SMC/SNR 結構深度分析 ====================
-def analyze_indicators(symbol):
-    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=210"
+# ==================== Martin 第一步與第二步：日線選強與 AVWAP/EMA 支撐 ====================
+def analyze_martin_daily_setup(symbol):
+    """ 抓取日線資料，計算 9/21/50 EMA 與階段高點 AVWAP 共振位 """
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=D&limit=60"
     try:
         resp = requests.get(url, timeout=3.5).json()
-        if resp.get("retCode") != 0 or not resp.get("result", {}).get("list"):
-            return None
-        
-        klines = resp["result"]["list"]
-        if len(klines) < 200:
+        klines = resp.get("result", {}).get("list", [])
+        if len(klines) < 30:
             return None
 
-        closes = [float(k[4]) for k in klines]
-        c0_close = closes[0]
-        c0_high = float(klines[0][2])
-        c0_low = float(klines[0][3])
+        # 排序：舊 -> 新
+        klines_asc = list(reversed(klines))
+        closes = [float(k[4]) for k in klines_asc]
+        highs = [float(k[2]) for k in klines_asc]
+        lows = [float(k[3]) for k in klines_asc]
+        volumes = [float(k[5]) for k in klines_asc]
 
-        c1_open = float(klines[1][1])
-        c1_high = float(klines[1][2])
-        c1_low = float(klines[1][3])
-        c1_close = float(klines[1][4])
+        c_now = closes[-1]
+        c_30d_ago = closes[-30]
+        momentum_30d = ((c_now - c_30d_ago) / c_30d_ago) * 100
 
-        c2_high = float(klines[2][2])
-        c2_low = float(klines[2][3])
+        # 1. 篩選強勢：30日內漲幅顯著
+        if momentum_30d < 15.0:
+            return None
 
-        # 1. EMA 20, 50, 200
-        ema20 = calculate_ema(closes, 20)
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
         ema50 = calculate_ema(closes, 50)
-        ema200 = calculate_ema(closes, 200)
 
-        # 2. SMC: FVG
-        fvg_signal = "無顯著 FVG"
-        if c0_low > c2_high:
-            gap_pct = round(((c0_low - c2_high) / c2_high) * 100, 2)
-            fvg_signal = f"🟢 看漲 FVG (+{gap_pct}%)"
-        elif c0_high < c2_low:
-            gap_pct = round(((c2_low - c0_high) / c2_low) * 100, 2)
-            fvg_signal = f"🔴 看跌 FVG (-{gap_pct}%)"
+        # 2. 回調低點抬高 (Higher Lows) 檢測
+        recent_lows = lows[-10:]
+        is_higher_lows = recent_lows[-1] >= recent_lows[0]
 
-        # 3. SMC: OB
-        ob_signal = "一般區域"
-        if c0_close > c1_high and c1_close < c1_open:
-            ob_signal = f"📦 突破多頭 OB ({format_price(c1_low)}~{format_price(c1_high)})"
-        elif c0_close < c1_low and c1_close > c1_open:
-            ob_signal = f"📦 跌破空頭 OB ({format_price(c1_low)}~{format_price(c1_high)})"
+        # 3. 尋找近 30 日最高點，計算 AVWAP
+        recent_30_highs = highs[-30:]
+        peak_high = max(recent_30_highs)
+        peak_idx = recent_30_highs.index(peak_high) + (len(highs) - 30)
 
-        # 4. SNR: Pivot
-        past_highs = [float(k[2]) for k in klines[1:21]]
-        past_lows = [float(k[3]) for k in klines[1:21]]
-        resistance = max(past_highs)
-        support = min(past_lows)
+        # 從 peak_idx 開始計算 AVWAP
+        pv_sum = sum((highs[i] + lows[i] + closes[i]) / 3 * volumes[i] for i in range(peak_idx, len(highs)))
+        vol_sum = sum(volumes[i] for i in range(peak_idx, len(highs)))
+        avwap_val = (pv_sum / vol_sum) if vol_sum > 0 else c_now
 
-        snr_status = "區間內震盪"
-        if c0_close >= resistance:
-            snr_status = f"🚀 突破關鍵壓力 ({format_price(resistance)})"
-        elif c0_close <= support:
-            snr_status = f"💥 跌破關鍵支撐 ({format_price(support)})"
+        # 4. 判斷價格是否接近 21 EMA 或 AVWAP 支撐區 (2.5% 內)
+        near_ema21 = abs(c_now - ema21) / c_now <= 0.025
+        near_avwap = abs(c_now - avwap_val) / c_now <= 0.025
 
-        return {
-            "fvg": fvg_signal,
-            "ob": ob_signal,
-            "snr_status": snr_status,
-            "support": support,
-            "resistance": resistance,
-            "last_price": c0_close,
-            "ema20": ema20,
-            "ema50": ema50,
-            "ema200": ema200
-        }
+        if is_higher_lows and (near_ema21 or near_avwap or c_now >= ema21 * 0.98):
+            return {
+                "ema9": ema9,
+                "ema21": ema21,
+                "ema50": ema50,
+                "avwap": avwap_val,
+                "peak_high": peak_high,
+                "support_zone": min(ema21, avwap_val)
+            }
+        return None
     except Exception:
         return None
 
-# ==================== 三階止盈 + 即時打點與止損原因診斷引擎 ====================
+# ==================== 三階止盈與即時打點播報覆盤引擎 ====================
 def update_signal_outcomes():
     now_ts = time.time()
     for sig in TRACKED_SIGNALS:
@@ -233,138 +205,95 @@ def update_signal_outcomes():
             last_price = float(ticker_data.get("lastPrice", 0))
 
             if direction == "LONG":
-                # 止損檢測 (-2.0%) + 診斷原因
+                # 止損 (-2.0%) + 診斷原因
                 if last_price <= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
-                    
                     sl_reasons = [
-                        "1. <b>結構失效</b>：價格實體向下跌破 5m EMA 200 動態支撐，第一拍突破確立為「假突破誘多陷阱」",
-                        "2. <b>多頭清算 (Long Liquidation)</b>：高位追高動能不足，引發獲利平倉與連鎖多單爆倉清算",
-                        "3. <b>大盤極短線洗盤</b>：遭遇市場反向急跌砸盤，貫穿 -2.0% 風控防守線"
+                        "1. <b>關鍵支撐跌破</b>：價格跌破 Martin 日線 AVWAP 與 21 EMA 重疊支撐位",
+                        "2. <b>微結構假突破</b>：5m 突破前高後遭遇賣壓，未能守住突破陽線低點",
+                        "3. <b>大盤聯動急洗</b>：大盤短線快速下挫，貫穿 -2.0% 防守位"
                     ]
                     reason_text = "\n".join([f"• {r}" for r in sl_reasons])
-
-                    loss_msg = f"""❌ <b>【單筆觸及止損告警】</b>
+                    loss_msg = f"""❌ <b>【Martin 策略 - 單筆止損告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 主力開多</b>
+方向：<b>🟢 多頭回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
 
-🔍 <b>【止損觸發原因診斷】</b>
+🔍 <b>【止損原因診斷】</b>
 {reason_text}
 
-⚠️ <i>已觸發 -2.0% 紀律止損，保護資金安全！請靜待下一次高勝率結構共振。</i>"""
+⚠️ <i>已觸發 -2.0% 紀律止損，嚴格控管 $100 風險！</i>"""
                     send_telegram_alert(loss_msg)
 
-                # TP3 檢測 (+4%)
+                # TP3 (+4.0% / 2R)
                 elif last_price >= sig["tp3"] and sig["notified_tp"] < 3:
                     sig["status"] = "WIN_TP3"
                     sig["notified_tp"] = 3
-                    tp3_msg = f"""🚀 <b>【單筆 TP3 滿盈離場告警】</b>
+                    tp3_msg = f"""🚀 <b>【Martin 策略 - TP3 滿盈離場告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 主力開多</b>
+方向：<b>🟢 多頭回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
 
-🎉 <i>已成功達標 TP3 (+4%)，恭喜滿盈離場獲利！</i>"""
+🎉 <i>已達標 TP3 (+4.0%)！大獲全勝，請全數獲利離場！</i>"""
                     send_telegram_alert(tp3_msg)
 
-                # TP2 檢測 (+3%)
+                # TP2 (+3.0%)
                 elif last_price >= sig["tp2"] and sig["notified_tp"] < 2:
                     sig["status"] = "WIN_TP2"
                     sig["notified_tp"] = 2
-                    tp2_msg = f"""🎯 <b>【單筆 TP2 達標告警】</b>
+                    tp2_msg = f"""🎯 <b>【Martin 策略 - TP2 達標告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 主力開多</b>
+方向：<b>🟢 多頭回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
 
-💪 <i>已成功達標 TP2 (+3%)，獲利大幅擴展中！</i>"""
+💪 <i>已達標 TP2 (+3.0%)！獲利持續擴展中！</i>"""
                     send_telegram_alert(tp2_msg)
 
-                # TP1 檢測 (+2%)
+                # TP1 (+2.0%)
                 elif last_price >= sig["tp1"] and sig["notified_tp"] < 1:
                     sig["status"] = "WIN_TP1"
                     sig["notified_tp"] = 1
-                    tp1_msg = f"""✅ <b>【單筆 TP1 達標告警】</b>
+                    tp1_msg = f"""✅ <b>【Martin 策略 - TP1 達標告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 主力開多</b>
+方向：<b>🟢 多頭回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
 
-💡 <i>已達標 TP1 (+2%)！建議平倉 50% 並將止損移至保本價！</i>"""
+💡 <i>已達標 TP1 (+2.0%)！建議平倉 50% 並將止損拉至進場保本價！</i>"""
                     send_telegram_alert(tp1_msg)
 
             else: # SHORT
-                # 止損檢測 (-2.0%) + 診斷原因
                 if last_price >= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
-                    
-                    sl_reasons = [
-                        "1. <b>結構失效</b>：價格實體向上強勢站回 5m EMA 200 動態壓力上方，原跌破確立為「假跌破誘空陷阱」",
-                        "2. <b>軋空行情 (Short Squeeze)</b>：空頭砸盤力量耗盡，逢低買盤與空頭止損引發快速反彈",
-                        "3. <b>大盤極短線洗盤</b>：遭遇大盤反向急拉，貫穿 -2.0% 風控防守線"
-                    ]
-                    reason_text = "\n".join([f"• {r}" for r in sl_reasons])
-
-                    loss_msg = f"""❌ <b>【單筆觸及止損告警】</b>
+                    loss_msg = f"""❌ <b>【Martin 策略 - 單筆止損告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🔴 主力開空</b>
+方向：<b>🔴 空頭回調開空</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
 
-🔍 <b>【止損觸發原因診斷】</b>
-{reason_text}
-
-⚠️ <i>已觸發 -2.0% 紀律止損，保護資金安全！請靜待下一次高勝率結構共振。</i>"""
+⚠️ <i>觸及 -2.0% 止損位，請執行紀律離場！</i>"""
                     send_telegram_alert(loss_msg)
 
-                # TP3 檢測 (+4%)
                 elif last_price <= sig["tp3"] and sig["notified_tp"] < 3:
                     sig["status"] = "WIN_TP3"
                     sig["notified_tp"] = 3
-                    tp3_msg = f"""🚀 <b>【單筆 TP3 滿盈離場告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🔴 主力開空</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
-
-🎉 <i>已成功達標 TP3 (+4%)，恭喜滿盈離場獲利！</i>"""
-                    send_telegram_alert(tp3_msg)
-
-                # TP2 檢測 (+3%)
+                    send_telegram_alert(f"🚀 <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP3 (+4.0%) 滿盈離場！")
                 elif last_price <= sig["tp2"] and sig["notified_tp"] < 2:
                     sig["status"] = "WIN_TP2"
                     sig["notified_tp"] = 2
-                    tp2_msg = f"""🎯 <b>【單筆 TP2 達標告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🔴 主力開空</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
-
-💪 <i>已成功達標 TP2 (+3%)，獲利大幅擴展中！</i>"""
-                    send_telegram_alert(tp2_msg)
-
-                # TP1 檢測 (+2%)
+                    send_telegram_alert(f"🎯 <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP2 (+3.0%)！")
                 elif last_price <= sig["tp1"] and sig["notified_tp"] < 1:
                     sig["status"] = "WIN_TP1"
                     sig["notified_tp"] = 1
-                    tp1_msg = f"""✅ <b>【單筆 TP1 達標告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🔴 主力開空</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
-
-💡 <i>已達標 TP1 (+2%)！建議平倉 50% 並將止損移至保本價！</i>"""
-                    send_telegram_alert(tp1_msg)
+                    send_telegram_alert(f"✅ <b>【Martin 策略】</b> <code>{symbol}</code> 達標 TP1 (+2.0%)！建議保本平半倉！")
 
         except Exception:
             pass
@@ -389,22 +318,22 @@ def check_and_send_daily_backtest_report():
         completed_cnt = tp1_cnt + loss_cnt
         win_rate = (tp1_cnt / completed_cnt * 100) if completed_cnt > 0 else 0.0
 
-        msg = f"""📈 <b>【數據獵手 24H 實盤策略覆盤戰報】</b>
+        msg = f"""📈 <b>【Martin 回調買入法 - 24H 實盤戰報】</b>
 
 📅 統計日期：<code>{today_date_str}</code>
 
-📊 <b>【實盤績效與盈虧比】</b>
+📊 <b>【實盤績效統計】</b>
 • 總發單訊號數：<b>{total_cnt} 筆</b> (日目標 10-15 筆)
-• TP1 達標 (2%)：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• TP2 達標 (3%)：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• TP3 滿盈 (4%)：<b>{tp3_cnt} 筆</b> ({tp3_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• SL 觸及止損 (-2.0%)：<b>{loss_cnt} 筆</b>
-• 進行中 / 持倉：<b>{pending_cnt} 筆</b>
+• TP1 命中 (+2%)：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• TP2 命中 (+3%)：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• TP3 滿盈 (+4%)：<b>{tp3_cnt} 筆</b> ({tp3_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• SL 止損 (-2.0%)：<b>{loss_cnt} 筆</b>
+• 持倉進行中：<b>{pending_cnt} 筆</b>
 
-🎯 <b>【實盤勝率評估】</b>
-• 策略勝率 (TP1 命中率)：<b>{win_rate:.1f}%</b> (目標 80%)
+🎯 <b>【實盤勝率】</b>
+• 策略勝率 (TP1 達標率)：<b>{win_rate:.1f}%</b> (目標 80%)
 
-💡 <i>嚴格執行 2.0% 止損與 2%/3%/4% 分段止盈，即時播報每單進展與止損原因！</i>"""
+💡 <i>嚴格遵照 Martin 4步驟：選強 + AVWAP共振 + 5m突破 + 1.0%風控算手數！</i>"""
 
         send_telegram_alert(msg)
         LAST_DAILY_BACKTEST_DATE = today_date_str
@@ -420,20 +349,20 @@ def check_and_send_sunday_report():
         for symbol, name in targets:
             try:
                 tf_views = get_multi_tf_views(symbol)
-                indi = analyze_indicators(symbol)
-                if not indi: continue
+                m_setup = analyze_martin_daily_setup(symbol)
+                if not m_setup: continue
 
-                report_msg = f"""📊 <b>【每週日主流幣合約週報】</b>
+                report_msg = f"""📊 <b>【每週日 Martin 策略主流幣大盤點評】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> ({name} 永續合約)
-當前價格：<b>{format_price(indi['last_price'])} USDT</b>
 
-🎯 <b>【關鍵結構與均線】</b>
-• 強壓力位：<code>{format_price(indi['resistance'])}</code> | 強支撐位：<code>{format_price(indi['support'])}</code>
-• 5m EMA 200：<code>{format_price(indi['ema200'])}</code>
-• SMC FVG：{indi['fvg']} | SMC OB：{indi['ob']}
+🎯 <b>【日線關鍵共振支撐】</b>
+• 9 EMA：<code>{format_price(m_setup['ema9'])}</code>
+• 21 EMA：<code>{format_price(m_setup['ema21'])}</code>
+• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code>
+• 強支撐重疊區：<code>{format_price(m_setup['support_zone'])}</code>
 
-🌐 <b>【大時框趨勢】</b>
+🌐 <b>【多時框趨勢】</b>
 • 1小時：{tf_views.get('1小時', 'N/A')} | 4小時：{tf_views.get('4小時', 'N/A')} | 日線：{tf_views.get('日線', 'N/A')}"""
 
                 send_telegram_alert(report_msg)
@@ -442,7 +371,7 @@ def check_and_send_sunday_report():
                 pass
         LAST_SUNDAY_REPORT_DATE = today_date_str
 
-# ==================== 單一標的高勝率嚴格篩選 ====================
+# ==================== 單一標的 Martin 打法掃描 (5m 微結構突破) ====================
 def inspect_symbol(ticker):
     symbol = ticker["symbol"]
     try:
@@ -450,7 +379,7 @@ def inspect_symbol(ticker):
         if symbol in ALERT_COOLDOWN and (now_time - ALERT_COOLDOWN[symbol]) < COOLDOWN_SECONDS:
             return
 
-        # 1. 抓取 OI 數據
+        # 1. 檢測 5m OI 爆量卡位
         oi_url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=2"
         oi_res = requests.get(oi_url, timeout=3).json()
         oi_list = oi_res.get("result", {}).get("list", [])
@@ -464,91 +393,65 @@ def inspect_symbol(ticker):
         if oi_change_pct < MIN_OI_GROWTH_PCT:
             return
 
-        # 2. 技術指標與 EMA 均線
-        indi = analyze_indicators(symbol)
-        if not indi: return
+        # 2. Martin 步驟一與二：日線選強與 AVWAP / 21 EMA 支撐重疊
+        m_setup = analyze_martin_daily_setup(symbol)
+        if not m_setup:
+            return
 
-        c0_close = indi["last_price"]
-        ema20 = indi["ema20"]
-        ema50 = indi["ema50"]
-        ema200 = indi["ema200"]
-
-        if not (ema20 and ema50 and ema200): return
-
-        # 3. 5m K 線體積與方向判斷
-        kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=2"
+        # 3. Martin 步驟三：5分鐘微結構突破 (Micro Breakout)
+        kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=3"
         k_res = requests.get(kline_url, timeout=3).json()
         klines = k_res.get("result", {}).get("list", [])
-        if not klines: return
+        if len(klines) < 2: return
 
         c0_open = float(klines[0][1])
         c0_high = float(klines[0][2])
         c0_low = float(klines[0][3])
+        c0_close = float(klines[0][4])
 
-        price_change_5m = ((c0_close - c0_open) / c0_open) * 100
-        volatility_5m = ((c0_high - c0_low) / c0_open) * 100
+        c1_high = float(klines[1][2])
+        c1_low = float(klines[1][3])
 
-        if volatility_5m < MIN_VOLATILITY_PCT: return
+        # 條件：當前 5m 收盤突破前一根 5m High (微結構發動)
+        is_micro_breakout = c0_close > c1_high
 
-        if price_change_5m >= MIN_PRICE_CHANGE_PCT:
-            is_bullish = True
-            direction_str = "LONG"
-            direction_disp = "🟢 主力合約開多 (Bullish)"
-        elif price_change_5m <= -MIN_PRICE_CHANGE_PCT:
-            is_bullish = False
-            direction_str = "SHORT"
-            direction_disp = "🔴 主力合約開空 (Bearish)"
-        else:
+        if not is_micro_breakout:
             return
 
-        # 【核心過濾 1：EMA 均線趨勢對齊】
-        if is_bullish:
-            if c0_close < ema200 or ema20 < ema50: return
-        else:
-            if c0_close > ema200 or ema20 > ema50: return
+        direction_str = "LONG"
+        direction_disp = "🟢 Martin 多頭回調買入 (Bullish)"
 
-        # 【核心過濾 2：SMC / SNR 結構打破】
-        fvg_text = indi["fvg"]
-        ob_text = indi["ob"]
-        snr_text = indi["snr_status"]
-
-        has_fvg = ("看漲 FVG" in fvg_text) if is_bullish else ("看跌 FVG" in fvg_text)
-        has_ob = ("突破多頭 OB" in ob_text) if is_bullish else ("跌破空頭 OB" in ob_text)
-        has_snr = ("突破關鍵壓力" in snr_text) if is_bullish else ("跌破關鍵支撐" in snr_text)
-
-        if not (has_fvg or has_ob or has_snr): return
-
-        # 【核心過濾 3：1h/4h 大時框趨勢過濾】
+        # 4. 多時框趨勢過濾 (1h/4h 不能是強空)
         tf_views = get_multi_tf_views(symbol)
         h1_tf = tf_views.get("1小時", "")
         h4_tf = tf_views.get("4小時", "")
-
-        if is_bullish:
-            if "🔴 空頭強勢" in h1_tf or "🔴 空頭強勢" in h4_tf: return
-        else:
-            if "🟢 多頭強勢" in h1_tf or "🟢 多頭強勢" in h4_tf: return
+        if "🔴 空頭強勢" in h1_tf or "🔴 空頭強勢" in h4_tf:
+            return
 
         # 觸發冷卻防護
         ALERT_COOLDOWN[symbol] = now_time
 
-        reasons = [
-            f"1. 5m OI 暴增 {oi_change_pct:+.2f}%，機構大資金進場",
-            f"2. 5m K 線強勢突破 {price_change_5m:+.2f}%",
-            f"3. 順應 EMA 20/50/200 多空均線排列"
-        ]
-        if has_fvg: reasons.append(f"4. SMC 失衡區觸發 ({fvg_text})")
-        if has_ob: reasons.append(f"5. SMC 訂單塊突破 ({ob_text})")
-        if has_snr: reasons.append(f"6. SNR 結構打破 ({snr_text})")
+        # 風控計算 (-2.0% SL, +2%/+3%/+4% TP)
+        sl_val = c0_close * 0.980
+        tp1_val = c0_close * 1.020
+        tp2_val = c0_close * 1.030
+        tp3_val = c0_close * 1.040
 
+        # 計算 Martin 1.0% 帳戶風控倉位 (假設 $10,000 帳戶單筆固定虧損 $100)
+        account_risk_100 = 100.0  # $10,000 * 1.0%
+        per_unit_risk = abs(c0_close - sl_val)
+        position_units = account_risk_100 / per_unit_risk if per_unit_risk > 0 else 0
+        position_value = position_units * c0_close
+
+        reasons = [
+            f"1. <b>日線強勢選股</b>：30日動能強勁，低點抬高 (Higher Lows)",
+            f"2. <b>關鍵支撐重疊</b>：價格落在日線 21 EMA ({format_price(m_setup['ema21'])}) 與階段高點 AVWAP ({format_price(m_setup['avwap'])}) 附近",
+            f"3. <b>5m 微結構突破</b>：收盤價格 ({format_price(c0_close)}) 強勢突破前一根 5m 最高價 ({format_price(c1_high)})",
+            f"4. <b>主力資金卡位</b>：5m 持倉量 (OI) 暴增 {oi_change_pct:+.2f}%"
+        ]
         reason_str = "\n".join([f"• {r}" for r in reasons])
 
-        # 【實盤精準風控：固定 2.0% 止損 | 2%、3%、4% 止盈】
-        sl_val = c0_close * 0.980 if is_bullish else c0_close * 1.020
-        tp1_val = c0_close * 1.020 if is_bullish else c0_close * 0.980
-        tp2_val = c0_close * 1.030 if is_bullish else c0_close * 0.970
-        tp3_val = c0_close * 1.040 if is_bullish else c0_close * 0.960
-
-        # 將實盤訊號寫入即時監控覆盤引擎
+        # 寫入即時監控覆盤引擎
         TRACKED_SIGNALS.append({
             "symbol": symbol,
             "direction": direction_str,
@@ -562,7 +465,7 @@ def inspect_symbol(ticker):
             "notified_tp": 0
         })
 
-        msg = f"""🚨 <b>【實盤第一拍 + 80% 勝率模組告警】</b>
+        msg = f"""🚨 <b>【Martin 回調買入法 + 微結構觸發告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
 方向：<b>{direction_disp}</b>
@@ -571,22 +474,21 @@ def inspect_symbol(ticker):
 💡 <b>【核心進場理由】</b>
 {reason_str}
 
-📈 <b>【EMA 均線結構】</b>
-• 5m EMA 20 / 50 / 200：<code>{format_price(ema20)}</code> / <code>{format_price(ema50)}</code> / <code>{format_price(ema200)}</code>
+🎯 <b>【日線關鍵重疊位】</b>
+• 9 EMA：<code>{format_price(m_setup['ema9'])}</code> | 21 EMA：<code>{format_price(m_setup['ema21'])}</code>
+• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code>
 
 🌐 <b>【多時框趨勢觀點】</b>
 • 5m: {tf_views.get('5分', 'N/A')} | 15m: {tf_views.get('15分', 'N/A')} | 1h: {h1_tf} | 4h: {h4_tf}
 
-🎯 <b>【SMC & SNR 結構】</b>
-• FVG: {fvg_text} | OB: {ob_text} | 狀態: {snr_text}
-
-🛡️ <b>【實盤風控點位】</b>
+🛡️ <b>【實盤風控與 Martin 1.0% 倉位建議】</b>
 • <b>止損 (SL -2.0%)</b>：<code>{format_price(sl_val)}</code>
-• <b>目標 1 (TP1 +2%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
-• <b>目標 2 (TP2 +3%)</b>：<code>{format_price(tp2_val)}</code>
-• <b>目標 3 (TP3 +4%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)"""
+• <b>目標 1 (TP1 +2.0%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
+• <b>目標 2 (TP2 +3.0%)</b>：<code>{format_price(tp2_val)}</code>
+• <b>目標 3 (TP3 +4.0%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)
+• <b>$10k 帳戶建倉參考</b>：約投入 <b>{position_value:.1f} USDT</b> (固定風控 $100 / 1.0%)"""
 
-        print(f"🔥 [實盤訊號發送] {symbol} | OI: {oi_change_pct:+.2f}% | SL -2.0% 含原因診斷")
+        print(f"🔥 [Martin 訊號觸發] {symbol} | OI: {oi_change_pct:+.2f}% | 風控 $100")
         send_telegram_alert(msg)
 
     except Exception:
@@ -595,7 +497,7 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 (止損原因診斷版) 已啟動...")
+    print("⚡ 數據獵手 (Martin 回調買入法 $100風控旗艦版) 已啟動...")
 
     while True:
         try:
@@ -609,7 +511,7 @@ def run_formal_hunter():
             tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
 
             now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 併發掃描 50 個永續合約標的...")
+            print(f"[{now_str}] 🔍 Martin 策略併發掃描 50 個合約標的...")
 
             with ThreadPoolExecutor(max_workers=10) as executor:
                 executor.map(inspect_symbol, tickers)
