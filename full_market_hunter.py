@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import threading
 from datetime import datetime, timezone, timedelta
@@ -32,44 +33,25 @@ def format_price(val):
     except Exception:
         return str(val)
 
-# ==================== EMA 計算 ====================
-def calculate_ema(closes, period):
-    if len(closes) < period:
-        return None
-    reversed_closes = list(reversed(closes))
-    k = 2 / (period + 1)
-    ema = reversed_closes[0]
-    for price in reversed_closes[1:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
+def clean_symbol(symbol_str):
+    """ 清理 TradingView 傳來的 ticker 名稱 (例如 BYBIT:BTCUSDT.P -> BTCUSDT) """
+    s = symbol_str.upper()
+    if ":" in s:
+        s = s.split(":")[-1]
+    if "." in s:
+        s = s.split(".")[0]
+    return s
 
-# ==================== 設定區 (AVWAP 100標的平行監控 + $100 風控) ====================
+# ==================== 設定區 (TradingView Webhook + $100 風控) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
-MIN_OI_GROWTH_PCT = 1.0      # 5m 持倉量增長門檻 1.0%
 ALERT_COOLDOWN = {}
-COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘冷卻
+COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘內不重複發送
 
 LAST_SUNDAY_REPORT_DATE = ""
 LAST_DAILY_BACKTEST_DATE = ""
 TRACKED_SIGNALS = []
-
-# ==================== Health Check 服務器 ====================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (100標的全自動 AVWAP 掃描版) 運行中".encode('utf-8'))
-
-    def log_message(self, format, *args):
-        return
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
 
 # ==================== Telegram 推播 ====================
 def send_telegram_alert(message):
@@ -86,9 +68,9 @@ def send_telegram_alert(message):
         resp = requests.post(url, json=payload, timeout=5)
         res_json = resp.json()
         if not res_json.get("ok"):
-            print(f"❌ Telegram 發送失敗 API 回應: {res_json.get('description')}")
+            print(f"❌ Telegram 發送失敗: {res_json.get('description')}")
         else:
-            print("✅ Telegram 推播成功發送！")
+            print("✅ Telegram Webhook 警報成功推播！")
     except Exception as e:
         print(f"❌ Telegram 連線異常: {e}")
 
@@ -120,66 +102,126 @@ def get_multi_tf_views(symbol):
             views[label] = "⚪ 讀取失敗"
     return views
 
-# ==================== Martin 日線選強與階段高點 AVWAP 計算 ====================
-def analyze_martin_daily_setup(symbol):
-    """ 抓取日線資料，精確計算階段高點 AVWAP 與 21 EMA 支撐位 """
-    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=D&limit=60"
+# ==================== 處理來自 TradingView 的 Webhook 警報 ====================
+def process_tradingview_alert(data):
     try:
-        resp = requests.get(url, timeout=3.5).json()
-        klines = resp.get("result", {}).get("list", [])
-        if len(klines) < 30:
-            return None
+        raw_symbol = str(data.get("symbol", ""))
+        symbol = clean_symbol(raw_symbol)
+        if not symbol: return
 
-        klines_asc = list(reversed(klines))
-        closes = [float(k[4]) for k in klines_asc]
-        highs = [float(k[2]) for k in klines_asc]
-        lows = [float(k[3]) for k in klines_asc]
-        volumes = [float(k[5]) for k in klines_asc]
+        now_time = time.time()
+        if symbol in ALERT_COOLDOWN and (now_time - ALERT_COOLDOWN[symbol]) < COOLDOWN_SECONDS:
+            print(f"⏳ [{symbol}] 冷卻中，跳過重複 Webhook 推播")
+            return
 
-        c_now = closes[-1]
-        c_30d_ago = closes[-30]
-        momentum_30d = ((c_now - c_30d_ago) / c_30d_ago) * 100
+        entry_price = float(data.get("price", 0))
+        if entry_price <= 0:
+            # 若 TV 沒傳 price，向 Bybit 查詢最新價
+            url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
+            res = requests.get(url, timeout=3).json()
+            entry_price = float(res["result"]["list"][0]["lastPrice"])
 
-        # 1. 篩選強勢標的 (近30日動能)
-        if momentum_30d < 10.0:
-            return None
+        ALERT_COOLDOWN[symbol] = now_time
 
-        ema9 = calculate_ema(closes, 9)
-        ema21 = calculate_ema(closes, 21)
-        ema50 = calculate_ema(closes, 50)
+        # 風控參數 (-2.0% SL, +2%/+3%/+4% TP)
+        sl_val = entry_price * 0.980
+        tp1_val = entry_price * 1.020
+        tp2_val = entry_price * 1.030
+        tp3_val = entry_price * 1.040
 
-        # 2. 回調低點抬高 (Higher Lows)
-        recent_lows = lows[-10:]
-        is_higher_lows = recent_lows[-1] >= recent_lows[0]
+        # 精算 $10,000 帳戶固定虧損 $100 (1.0% 風控比例) 的建倉金額
+        account_risk_100 = 100.0
+        per_unit_risk = abs(entry_price - sl_val)
+        position_units = account_risk_100 / per_unit_risk if per_unit_risk > 0 else 0
+        position_value = position_units * entry_price
 
-        # 3. 尋找近 30 日最高點，精確計算 AVWAP
-        recent_30_highs = highs[-30:]
-        peak_high = max(recent_30_highs)
-        peak_idx = recent_30_highs.index(peak_high) + (len(highs) - 30)
+        # 多時框觀點
+        tf_views = get_multi_tf_views(symbol)
 
-        pv_sum = sum((highs[i] + lows[i] + closes[i]) / 3 * volumes[i] for i in range(peak_idx, len(highs)))
-        vol_sum = sum(volumes[i] for i in range(peak_idx, len(highs)))
-        avwap_val = (pv_sum / vol_sum) if vol_sum > 0 else c_now
+        reasons = [
+            f"1. <b>📡 TradingView 訊號觸發</b>：AVWAP + 5m 微結構突破觸發",
+            f"2. <b>🎯 觸發價格</b>：<code>{format_price(entry_price)} USDT</code>",
+            f"3. <b>🛡️ 嚴格風控</b>：單筆固定虧損 $100 (1.0% Risk)"
+        ]
+        reason_str = "\n".join([f"• {r}" for r in reasons])
 
-        # 4. 判斷價格是否落在 AVWAP 或 21 EMA 支撐區 (2.5% 範圍內)
-        dist_avwap_pct = abs(c_now - avwap_val) / c_now * 100
-        dist_ema21_pct = abs(c_now - ema21) / c_now * 100
+        # 加入 24H 戰報追蹤引擎
+        TRACKED_SIGNALS.append({
+            "symbol": symbol,
+            "direction": "LONG",
+            "entry_price": entry_price,
+            "sl": sl_val,
+            "tp1": tp1_val,
+            "tp2": tp2_val,
+            "tp3": tp3_val,
+            "created_at": now_time,
+            "status": "PENDING",
+            "notified_tp": 0
+        })
 
-        if is_higher_lows and (dist_avwap_pct <= 2.5 or dist_ema21_pct <= 2.5 or c_now >= ema21 * 0.98):
-            return {
-                "ema9": ema9,
-                "ema21": ema21,
-                "ema50": ema50,
-                "avwap": avwap_val,
-                "dist_avwap_pct": dist_avwap_pct,
-                "peak_high": peak_high,
-                "support_zone": min(ema21, avwap_val)
-            }
-        return None
-    except Exception:
-        return None
+        msg = f"""🚨 <b>【📈 TradingView AVWAP 微結構觸發告警】</b>
 
-# ==================== 三階止盈與即時打點播報覆盤引擎 ====================
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🟢 多頭回調買入 (Bullish)</b>
+當前進場價：<b>{format_price(entry_price)} USDT</b>
+
+💡 <b>【訊號摘要】</b>
+{reason_str}
+
+🌐 <b>【多時框趨勢觀點】</b>
+• 5m: {tf_views.get('5分', 'N/A')} | 15m: {tf_views.get('15分', 'N/A')} | 1h: {tf_views.get('1小時', 'N/A')} | 4h: {tf_views.get('4小時', 'N/A')}
+
+🛡️ <b>【實盤風控與 $100 倉位建議】</b>
+• <b>止損 (SL -2.0%)</b>：<code>{format_price(sl_val)}</code>
+• <b>目標 1 (TP1 +2.0%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
+• <b>目標 2 (TP2 +3.0%)</b>：<code>{format_price(tp2_val)}</code>
+• <b>目標 3 (TP3 +4.0%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)
+• <b>$10k 帳戶建倉參考</b>：約投入 <b>{position_value:.1f} USDT</b> (固定風控 $100 / 1.0%)"""
+
+        print(f"🔥 [TradingView Webhook 觸發] {symbol} @ {entry_price} | 風控 $100")
+        send_telegram_alert(msg)
+
+    except Exception as e:
+        print(f"❌ 處理 TradingView 警報時發生錯誤: {e}")
+
+# ==================== Health Check & Webhook 接收服務器 ====================
+class WebhookAndHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write("⚡ 數據獵手 (TradingView Webhook 接收端) 運行中".encode('utf-8'))
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        
+        try:
+            # 解析 TradingView 傳來的 JSON Payload
+            data = json.loads(post_data.decode('utf-8'))
+            print(f"📩 收到 Webhook Payload: {data}")
+            
+            # 在背景線程處理，不阻塞 HTTP 回應
+            threading.Thread(target=process_tradingview_alert, args=(data,)).start()
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+        except Exception as e:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        return
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), WebhookAndHealthHandler)
+    server.serve_forever()
+
+# ==================== 三階止盈與覆盤引擎 ====================
 def update_signal_outcomes():
     now_ts = time.time()
     for sig in TRACKED_SIGNALS:
@@ -192,98 +234,44 @@ def update_signal_outcomes():
 
         try:
             symbol = sig["symbol"]
-            direction = sig["direction"]
             entry_price = sig["entry_price"]
             
             url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
             res = requests.get(url, timeout=3).json()
             ticker_data = res.get("result", {}).get("list", [{}])[0]
-            if not ticker_data:
-                continue
+            if not ticker_data: continue
 
             last_price = float(ticker_data.get("lastPrice", 0))
 
-            if direction == "LONG":
-                # 止損 (-2.0%) + 診斷原因
-                if last_price <= sig["sl"] and sig["status"] == "PENDING":
-                    sig["status"] = "LOSS"
-                    sl_reasons = [
-                        "1. <b>AVWAP 支撐跌破</b>：價格實體向下跌破階段高點 AVWAP 防守線",
-                        "2. <b>微結構突破失敗</b>：5m 突破前高後缺乏買盤跟進，未能守住突破陽線低點",
-                        "3. <b>大盤聯動急洗</b>：大盤短線快速下挫，貫穿 -2.0% 防守位"
-                    ]
-                    reason_text = "\n".join([f"• {r}" for r in sl_reasons])
-                    loss_msg = f"""❌ <b>【AVWAP 策略 - 單筆止損告警】</b>
+            # SL (-2.0%)
+            if last_price <= sig["sl"] and sig["status"] == "PENDING":
+                sig["status"] = "LOSS"
+                loss_msg = f"""❌ <b>【TradingView 策略 - 單筆止損告警】</b>
 
 📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 AVWAP 回調買入</b>
 進場價格：<b>{format_price(entry_price)} USDT</b>
 觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
 
-🔍 <b>【止損原因診斷】</b>
-{reason_text}
-
 ⚠️ <i>已觸發 -2.0% 紀律止損，嚴格控管 $100 風險！</i>"""
-                    send_telegram_alert(loss_msg)
+                send_telegram_alert(loss_msg)
 
-                # TP3 (+4.0%)
-                elif last_price >= sig["tp3"] and sig["notified_tp"] < 3:
-                    sig["status"] = "WIN_TP3"
-                    sig["notified_tp"] = 3
-                    tp3_msg = f"""🚀 <b>【AVWAP 策略 - TP3 滿盈離場告警】</b>
+            # TP3 (+4.0%)
+            elif last_price >= sig["tp3"] and sig["notified_tp"] < 3:
+                sig["status"] = "WIN_TP3"
+                sig["notified_tp"] = 3
+                send_telegram_alert(f"🚀 <b>【TradingView 策略】</b> <code>{symbol}</code> 達標 TP3 (+4.0%) 滿盈離場！")
 
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 AVWAP 回調買入</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
+            # TP2 (+3.0%)
+            elif last_price >= sig["tp2"] and sig["notified_tp"] < 2:
+                sig["status"] = "WIN_TP2"
+                sig["notified_tp"] = 2
+                send_telegram_alert(f"🎯 <b>【TradingView 策略】</b> <code>{symbol}</code> 達標 TP2 (+3.0%)！")
 
-🎉 <i>已達標 TP3 (+4.0%)！大獲全勝，請全數獲利離場！</i>"""
-                    send_telegram_alert(tp3_msg)
-
-                # TP2 (+3.0%)
-                elif last_price >= sig["tp2"] and sig["notified_tp"] < 2:
-                    sig["status"] = "WIN_TP2"
-                    sig["notified_tp"] = 2
-                    tp2_msg = f"""🎯 <b>【AVWAP 策略 - TP2 達標告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 AVWAP 回調買入</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
-
-💪 <i>已達標 TP2 (+3.0%)！獲利持續擴展中！</i>"""
-                    send_telegram_alert(tp2_msg)
-
-                # TP1 (+2.0%)
-                elif last_price >= sig["tp1"] and sig["notified_tp"] < 1:
-                    sig["status"] = "WIN_TP1"
-                    sig["notified_tp"] = 1
-                    tp1_msg = f"""✅ <b>【AVWAP 策略 - TP1 達標告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>🟢 AVWAP 回調買入</b>
-進場價格：<b>{format_price(entry_price)} USDT</b>
-當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
-
-💡 <i>已達標 TP1 (+2.0%)！建議平倉 50% 並將止損拉至進場保本價！</i>"""
-                    send_telegram_alert(tp1_msg)
-
-            else: # SHORT
-                if last_price >= sig["sl"] and sig["status"] == "PENDING":
-                    sig["status"] = "LOSS"
-                    send_telegram_alert(f"❌ <b>【AVWAP 策略】</b> <code>{symbol}</code> 觸及 -2.0% 止損！")
-                elif last_price <= sig["tp3"] and sig["notified_tp"] < 3:
-                    sig["status"] = "WIN_TP3"
-                    sig["notified_tp"] = 3
-                    send_telegram_alert(f"🚀 <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP3 (+4.0%) 滿盈離場！")
-                elif last_price <= sig["tp2"] and sig["notified_tp"] < 2:
-                    sig["status"] = "WIN_TP2"
-                    sig["notified_tp"] = 2
-                    send_telegram_alert(f"🎯 <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP2 (+3.0%)！")
-                elif last_price <= sig["tp1"] and sig["notified_tp"] < 1:
-                    sig["status"] = "WIN_TP1"
-                    sig["notified_tp"] = 1
-                    send_telegram_alert(f"✅ <b>【AVWAP 策略】</b> <code>{symbol}</code> 達標 TP1 (+2.0%)！建議保本平半倉！")
+            # TP1 (+2.0%)
+            elif last_price >= sig["tp1"] and sig["notified_tp"] < 1:
+                sig["status"] = "WIN_TP1"
+                sig["notified_tp"] = 1
+                send_telegram_alert(f"✅ <b>【TradingView 策略】</b> <code>{symbol}</code> 達標 TP1 (+2.0%)！建議保本平半倉！")
 
         except Exception:
             pass
@@ -308,212 +296,40 @@ def check_and_send_daily_backtest_report():
         completed_cnt = tp1_cnt + loss_cnt
         win_rate = (tp1_cnt / completed_cnt * 100) if completed_cnt > 0 else 0.0
 
-        msg = f"""📈 <b>【AVWAP 回調買入法 - 24H 實盤戰報】</b>
+        msg = f"""📈 <b>【TradingView AVWAP 策略 - 24H 實盤戰報】</b>
 
 📅 統計日期：<code>{today_date_str}</code>
 
 📊 <b>【實盤績效統計】</b>
-• 總發單訊號數：<b>{total_cnt} 筆</b>
-• TP1 命中 (+2%)：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• TP2 命中 (+3%)：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• TP3 滿盈 (+4%)：<b>{tp3_cnt} 筆</b> ({tp3_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
+• 總接收訊號數：<b>{total_cnt} 筆</b>
+• TP1 命中 (+2%)：<b>{tp1_cnt} 筆</b>
+• TP2 命中 (+3%)：<b>{tp2_cnt} 筆</b>
+• TP3 滿盈 (+4%)：<b>{tp3_cnt} 筆</b>
 • SL 止損 (-2.0%)：<b>{loss_cnt} 筆</b>
 • 持倉進行中：<b>{pending_cnt} 筆</b>
 
 🎯 <b>【實盤勝率】</b>
-• 策略勝率 (TP1 達標率)：<b>{win_rate:.1f}%</b> (目標 80%)
+• 策略勝率 (TP1 達標率)：<b>{win_rate:.1f}%</b>
 
-💡 <i>專注 AVWAP 機構成本支撐共振 + 5m 微結構突破 + $100 固定風控！</i>"""
+💡 <i>專注 TradingView 精準訊號 + 0.5%/1.0% 風控算手數！</i>"""
 
         send_telegram_alert(msg)
         LAST_DAILY_BACKTEST_DATE = today_date_str
 
-# ==================== 週日 BTC/ETH 大盤週報 ====================
-def check_and_send_sunday_report():
-    global LAST_SUNDAY_REPORT_DATE
-    now_dt = get_taipei_now()
-    today_date_str = now_dt.strftime("%Y-%m-%d")
-
-    if now_dt.weekday() == 6 and LAST_SUNDAY_REPORT_DATE != today_date_str:
-        targets = [("BTCUSDT", "比特幣"), ("ETHUSDT", "以太坊")]
-        for symbol, name in targets:
-            try:
-                tf_views = get_multi_tf_views(symbol)
-                m_setup = analyze_martin_daily_setup(symbol)
-                if not m_setup: continue
-
-                report_msg = f"""📊 <b>【每週日 AVWAP 策略主流幣大盤點評】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> ({name} 永續合約)
-
-🎯 <b>【日線 AVWAP 與均線支撐】</b>
-• 階段高點 AVWAP：<code>{format_price(m_setup['avwap'])}</code> (距離 {m_setup['dist_avwap_pct']:.2f}%)
-• 21 EMA：<code>{format_price(m_setup['ema21'])}</code> | 9 EMA：<code>{format_price(m_setup['ema9'])}</code>
-• 關鍵支撐區：<code>{format_price(m_setup['support_zone'])}</code>
-
-🌐 <b>【多時框趨勢】</b>
-• 1小時：{tf_views.get('1小時', 'N/A')} | 4小時：{tf_views.get('4小時', 'N/A')} | 日線：{tf_views.get('日線', 'N/A')}"""
-
-                send_telegram_alert(report_msg)
-                time.sleep(2)
-            except Exception:
-                pass
-        LAST_SUNDAY_REPORT_DATE = today_date_str
-
-# ==================== 單一標的 AVWAP 觸發掃描 (5m 微結構突破) ====================
-def inspect_symbol(ticker):
-    symbol = ticker["symbol"]
-    try:
-        now_time = time.time()
-        if symbol in ALERT_COOLDOWN and (now_time - ALERT_COOLDOWN[symbol]) < COOLDOWN_SECONDS:
-            return
-
-        # 1. 檢測 5m OI 爆量卡位
-        oi_url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=2"
-        oi_res = requests.get(oi_url, timeout=3).json()
-        oi_list = oi_res.get("result", {}).get("list", [])
-        if len(oi_list) < 2: return
-
-        oi_now = float(oi_list[0]["openInterest"])
-        oi_prev = float(oi_list[1]["openInterest"])
-        if oi_prev <= 0: return
-
-        oi_change_pct = ((oi_now - oi_prev) / oi_prev) * 100
-        if oi_change_pct < MIN_OI_GROWTH_PCT:
-            return
-
-        # 2. 檢測 AVWAP 日線層面支撐區
-        m_setup = analyze_martin_daily_setup(symbol)
-        if not m_setup:
-            return
-
-        avwap_val = m_setup["avwap"]
-        dist_avwap_pct = m_setup["dist_avwap_pct"]
-
-        # 3. 檢測 5m 微結構突破 (Micro Breakout)
-        kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=3"
-        k_res = requests.get(kline_url, timeout=3).json()
-        klines = k_res.get("result", {}).get("list", [])
-        if len(klines) < 2: return
-
-        c0_open = float(klines[0][1])
-        c0_high = float(klines[0][2])
-        c0_low = float(klines[0][3])
-        c0_close = float(klines[0][4])
-
-        c1_high = float(klines[1][2])
-        c1_low = float(klines[1][3])
-
-        # 條件：5m 收盤價強勢突破前一根 5m High (微結構突破確立)
-        is_micro_breakout = c0_close > c1_high
-        if not is_micro_breakout:
-            return
-
-        direction_str = "LONG"
-        direction_disp = "🟢 AVWAP 支撐共振 + 多頭突破 (Bullish)"
-
-        # 4. 多時框趨勢過濾 (1h/4h 不能是強空)
-        tf_views = get_multi_tf_views(symbol)
-        h1_tf = tf_views.get("1小時", "")
-        h4_tf = tf_views.get("4小時", "")
-        if "🔴 空頭強勢" in h1_tf or "🔴 空頭強勢" in h4_tf:
-            return
-
-        # 觸發冷卻防護
-        ALERT_COOLDOWN[symbol] = now_time
-
-        # 風控計算 (-2.0% SL, +2%/+3%/+4% TP)
-        sl_val = c0_close * 0.980
-        tp1_val = c0_close * 1.020
-        tp2_val = c0_close * 1.030
-        tp3_val = c0_close * 1.040
-
-        # 計算 Martin 1.0% 帳戶風控倉位 ($10,000 帳戶單筆固定虧損 $100)
-        account_risk_100 = 100.0
-        per_unit_risk = abs(c0_close - sl_val)
-        position_units = account_risk_100 / per_unit_risk if per_unit_risk > 0 else 0
-        position_value = position_units * c0_close
-
-        reasons = [
-            f"1. <b>🎯 AVWAP 關鍵支撐觸發</b>：價格精準回測階段高點 AVWAP 成本線 (距離僅 {dist_avwap_pct:.2f}%)",
-            f"2. <b>⚡ 5m 微結構發動</b>：收盤價 ({format_price(c0_close)}) 強勢突破前一根 5m K 線最高價 ({format_price(c1_high)})",
-            f"3. <b>📈 日線強勢結構</b>：30日漲幅顯著，回調低點持續抬高 (Higher Lows)",
-            f"4. <b>🔥 5m 持倉量爆量</b>：OI 增長 {oi_change_pct:+.2f}%，機構資金同步進場"
-        ]
-        reason_str = "\n".join([f"• {r}" for r in reasons])
-
-        # 寫入即時監控覆盤引擎
-        TRACKED_SIGNALS.append({
-            "symbol": symbol,
-            "direction": direction_str,
-            "entry_price": c0_close,
-            "sl": sl_val,
-            "tp1": tp1_val,
-            "tp2": tp2_val,
-            "tp3": tp3_val,
-            "created_at": now_time,
-            "status": "PENDING",
-            "notified_tp": 0
-        })
-
-        msg = f"""🚨 <b>【🎯 AVWAP 關鍵支撐 + 5m 微結構觸發告警】</b>
-
-📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
-方向：<b>{direction_disp}</b>
-當前進場價：<b>{format_price(c0_close)} USDT</b>
-
-💡 <b>【核心進場理由】</b>
-{reason_str}
-
-🎯 <b>【關鍵支撐價位】</b>
-• <b>階段高點 AVWAP</b>：<code>{format_price(avwap_val)}</code>
-• <b>日線 21 EMA</b>：<code>{format_price(m_setup['ema21'])}</code>
-
-🌐 <b>【多時框趨勢觀點】</b>
-• 5m: {tf_views.get('5分', 'N/A')} | 15m: {tf_views.get('15分', 'N/A')} | 1h: {h1_tf} | 4h: {h4_tf}
-
-🛡️ <b>【實盤風控與 $100 倉位建議】</b>
-• <b>止損 (SL -2.0%)</b>：<code>{format_price(sl_val)}</code>
-• <b>目標 1 (TP1 +2.0%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
-• <b>目標 2 (TP2 +3.0%)</b>：<code>{format_price(tp2_val)}</code>
-• <b>目標 3 (TP3 +4.0%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)
-• <b>$10k 帳戶建倉參考</b>：約投入 <b>{position_value:.1f} USDT</b> (固定風控 $100 / 1.0%)"""
-
-        print(f"🔥 [AVWAP 觸發訊號] {symbol} | AVWAP: {format_price(avwap_val)} | 風控 $100")
-        send_telegram_alert(msg)
-
-    except Exception:
-        pass
-
-# ==================== 主監控循環 ====================
+# ==================== 主服務循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 (100標的全自動 AVWAP 掃描版) 已啟動...")
+    print("⚡ 數據獵手 (TradingView Webhook 接收端) 已啟動...")
 
     while True:
         try:
+            # 輪詢更新持倉與止盈止損狀況
             update_signal_outcomes()
             check_and_send_daily_backtest_report()
-            check_and_send_sunday_report()
-
-            url = "https://api.bybit.com/v5/market/tickers?category=linear"
-            res = requests.get(url, timeout=5).json()
-            tickers = res.get("result", {}).get("list", [])
-            
-            # 【直接放大至 100 個熱門標的】
-            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:100]
-
-            now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 AVWAP 併發掃描 前 100 個熱門合約標的...")
-
-            # 併發提升至 15 線程，保持高效掃描
-            with ThreadPoolExecutor(max_workers=15) as executor:
-                executor.map(inspect_symbol, tickers)
-
         except Exception as e:
-            print(f"掃描異常: {e}")
+            print(f"覆盤循環異常: {e}")
 
-        time.sleep(15)
+        time.sleep(10)
 
 if __name__ == "__main__":
     run_formal_hunter()
