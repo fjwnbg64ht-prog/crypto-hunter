@@ -43,13 +43,13 @@ def calculate_ema(closes, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# ==================== 設定區 (AVWAP 多標的平行監控 + $100 風控) ====================
+# ==================== 設定區 (AVWAP 100標的平行監控 + $100 風控) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
-MIN_OI_GROWTH_PCT = 1.0      # 5m 持倉量增長門檻 1.0% (捕捉更多優質標的)
+MIN_OI_GROWTH_PCT = 1.0      # 5m 持倉量增長門檻 1.0%
 ALERT_COOLDOWN = {}
-COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘冷卻 (不同標的同步發送不影響)
+COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘冷卻
 
 LAST_SUNDAY_REPORT_DATE = ""
 LAST_DAILY_BACKTEST_DATE = ""
@@ -61,7 +61,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (AVWAP 多標的平行推播版) 運行中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (100標的全自動 AVWAP 掃描版) 運行中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -488,7 +488,7 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 (AVWAP 多標的平行推播版) 已啟動...")
+    print("⚡ 數據獵手 (100標的全自動 AVWAP 掃描版) 已啟動...")
 
     while True:
         try:
@@ -499,12 +499,15 @@ def run_formal_hunter():
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
             res = requests.get(url, timeout=5).json()
             tickers = res.get("result", {}).get("list", [])
-            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
+            
+            # 【直接放大至 100 個熱門標的】
+            tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:100]
 
             now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 AVWAP 併發掃描 50 個合約標的...")
+            print(f"[{now_str}] 🔍 AVWAP 併發掃描 前 100 個熱門合約標的...")
 
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            # 併發提升至 15 線程，保持高效掃描
+            with ThreadPoolExecutor(max_workers=15) as executor:
                 executor.map(inspect_symbol, tickers)
 
         except Exception as e:
