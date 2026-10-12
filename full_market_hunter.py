@@ -43,13 +43,13 @@ def calculate_ema(closes, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# ==================== 設定區 (AVWAP 觸發專用 + $100 風控 1.0%) ====================
+# ==================== 設定區 (AVWAP 多標的平行監控 + $100 風控) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
-MIN_OI_GROWTH_PCT = 1.2      # 5m 持倉量增長門檻 1.2%
+MIN_OI_GROWTH_PCT = 1.0      # 5m 持倉量增長門檻 1.0% (捕捉更多優質標的)
 ALERT_COOLDOWN = {}
-COOLDOWN_SECONDS = 600       # 同一標的 10 分鐘內不重複推播
+COOLDOWN_SECONDS = 300       # 同一標的 5 分鐘冷卻 (不同標的同步發送不影響)
 
 LAST_SUNDAY_REPORT_DATE = ""
 LAST_DAILY_BACKTEST_DATE = ""
@@ -61,7 +61,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (AVWAP 觸發告警旗艦版) 運行中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (AVWAP 多標的平行推播版) 運行中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -120,7 +120,7 @@ def get_multi_tf_views(symbol):
             views[label] = "⚪ 讀取失敗"
     return views
 
-# ==================== Martin 步驟一與二：日線選強與階段高點 AVWAP 計算 ====================
+# ==================== Martin 日線選強與階段高點 AVWAP 計算 ====================
 def analyze_martin_daily_setup(symbol):
     """ 抓取日線資料，精確計算階段高點 AVWAP 與 21 EMA 支撐位 """
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=D&limit=60"
@@ -130,7 +130,6 @@ def analyze_martin_daily_setup(symbol):
         if len(klines) < 30:
             return None
 
-        # 排序：舊 -> 新
         klines_asc = list(reversed(klines))
         closes = [float(k[4]) for k in klines_asc]
         highs = [float(k[2]) for k in klines_asc]
@@ -142,7 +141,7 @@ def analyze_martin_daily_setup(symbol):
         momentum_30d = ((c_now - c_30d_ago) / c_30d_ago) * 100
 
         # 1. 篩選強勢標的 (近30日動能)
-        if momentum_30d < 12.0:
+        if momentum_30d < 10.0:
             return None
 
         ema9 = calculate_ema(closes, 9)
@@ -314,7 +313,7 @@ def check_and_send_daily_backtest_report():
 📅 統計日期：<code>{today_date_str}</code>
 
 📊 <b>【實盤績效統計】</b>
-• 總發單訊號數：<b>{total_cnt} 筆</b> (日目標 10-15 筆)
+• 總發單訊號數：<b>{total_cnt} 筆</b>
 • TP1 命中 (+2%)：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
 • TP2 命中 (+3%)：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
 • TP3 滿盈 (+4%)：<b>{tp3_cnt} 筆</b> ({tp3_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
@@ -489,7 +488,7 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 (AVWAP 觸發告警旗艦版) 已啟動...")
+    print("⚡ 數據獵手 (AVWAP 多標的平行推播版) 已啟動...")
 
     while True:
         try:
@@ -503,7 +502,7 @@ def run_formal_hunter():
             tickers = sorted(tickers, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)[:50]
 
             now_str = get_taipei_now_str()
-            print(f"[{now_str}] 🔍 AVWAP 策略併發掃描 50 個合約標的...")
+            print(f"[{now_str}] 🔍 AVWAP 併發掃描 50 個合約標的...")
 
             with ThreadPoolExecutor(max_workers=10) as executor:
                 executor.map(inspect_symbol, tickers)
