@@ -43,7 +43,7 @@ def calculate_ema(closes, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# ==================== 設定區 (實盤 10-15單/日 + 1.5%SL / 2%3%4%TP) ====================
+# ==================== 設定區 (實盤 10-15單/日 + 2%SL含原因診斷 / 2%3%4%TP) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6132673542")
 
@@ -67,7 +67,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("⚡ 數據獵手 (實盤 1.5%SL 80%勝率版) 24H 雲端監控中".encode('utf-8'))
+        self.wfile.write("⚡ 數據獵手 (止損原因診斷版) 24H 雲端監控中".encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -208,11 +208,11 @@ def analyze_indicators(symbol):
     except Exception:
         return None
 
-# ==================== 三階止盈實盤自動覆盤引擎 ====================
+# ==================== 三階止盈 + 即時打點與止損原因診斷引擎 ====================
 def update_signal_outcomes():
     now_ts = time.time()
     for sig in TRACKED_SIGNALS:
-        if sig["status"] == "EXPIRED" or sig["status"] == "LOSS":
+        if sig["status"] in ["WIN_TP3", "LOSS", "EXPIRED"]:
             continue
         
         if (now_ts - sig["created_at"]) > 43200 and sig["status"] == "PENDING":
@@ -221,6 +221,9 @@ def update_signal_outcomes():
 
         try:
             symbol = sig["symbol"]
+            direction = sig["direction"]
+            entry_price = sig["entry_price"]
+            
             url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
             res = requests.get(url, timeout=3).json()
             ticker_data = res.get("result", {}).get("list", [{}])[0]
@@ -229,24 +232,139 @@ def update_signal_outcomes():
 
             last_price = float(ticker_data.get("lastPrice", 0))
 
-            if sig["direction"] == "LONG":
-                if last_price >= sig["tp3"]:
-                    sig["status"] = "WIN_TP3"
-                elif last_price >= sig["tp2"] and sig["status"] != "WIN_TP3":
-                    sig["status"] = "WIN_TP2"
-                elif last_price >= sig["tp1"] and sig["status"] not in ["WIN_TP2", "WIN_TP3"]:
-                    sig["status"] = "WIN_TP1"
-                elif last_price <= sig["sl"] and sig["status"] == "PENDING":
+            if direction == "LONG":
+                # 止損檢測 (-2.0%) + 診斷原因
+                if last_price <= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
+                    
+                    sl_reasons = [
+                        "1. <b>結構失效</b>：價格實體向下跌破 5m EMA 200 動態支撐，第一拍突破確立為「假突破誘多陷阱」",
+                        "2. <b>多頭清算 (Long Liquidation)</b>：高位追高動能不足，引發獲利平倉與連鎖多單爆倉清算",
+                        "3. <b>大盤極短線洗盤</b>：遭遇市場反向急跌砸盤，貫穿 -2.0% 風控防守線"
+                    ]
+                    reason_text = "\n".join([f"• {r}" for r in sl_reasons])
+
+                    loss_msg = f"""❌ <b>【單筆觸及止損告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🟢 主力開多</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
+
+🔍 <b>【止損觸發原因診斷】</b>
+{reason_text}
+
+⚠️ <i>已觸發 -2.0% 紀律止損，保護資金安全！請靜待下一次高勝率結構共振。</i>"""
+                    send_telegram_alert(loss_msg)
+
+                # TP3 檢測 (+4%)
+                elif last_price >= sig["tp3"] and sig["notified_tp"] < 3:
+                    sig["status"] = "WIN_TP3"
+                    sig["notified_tp"] = 3
+                    tp3_msg = f"""🚀 <b>【單筆 TP3 滿盈離場告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🟢 主力開多</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
+
+🎉 <i>已成功達標 TP3 (+4%)，恭喜滿盈離場獲利！</i>"""
+                    send_telegram_alert(tp3_msg)
+
+                # TP2 檢測 (+3%)
+                elif last_price >= sig["tp2"] and sig["notified_tp"] < 2:
+                    sig["status"] = "WIN_TP2"
+                    sig["notified_tp"] = 2
+                    tp2_msg = f"""🎯 <b>【單筆 TP2 達標告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🟢 主力開多</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
+
+💪 <i>已成功達標 TP2 (+3%)，獲利大幅擴展中！</i>"""
+                    send_telegram_alert(tp2_msg)
+
+                # TP1 檢測 (+2%)
+                elif last_price >= sig["tp1"] and sig["notified_tp"] < 1:
+                    sig["status"] = "WIN_TP1"
+                    sig["notified_tp"] = 1
+                    tp1_msg = f"""✅ <b>【單筆 TP1 達標告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🟢 主力開多</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
+
+💡 <i>已達標 TP1 (+2%)！建議平倉 50% 並將止損移至保本價！</i>"""
+                    send_telegram_alert(tp1_msg)
+
             else: # SHORT
-                if last_price <= sig["tp3"]:
-                    sig["status"] = "WIN_TP3"
-                elif last_price <= sig["tp2"] and sig["status"] != "WIN_TP3":
-                    sig["status"] = "WIN_TP2"
-                elif last_price <= sig["tp1"] and sig["status"] not in ["WIN_TP2", "WIN_TP3"]:
-                    sig["status"] = "WIN_TP1"
-                elif last_price >= sig["sl"] and sig["status"] == "PENDING":
+                # 止損檢測 (-2.0%) + 診斷原因
+                if last_price >= sig["sl"] and sig["status"] == "PENDING":
                     sig["status"] = "LOSS"
+                    
+                    sl_reasons = [
+                        "1. <b>結構失效</b>：價格實體向上強勢站回 5m EMA 200 動態壓力上方，原跌破確立為「假跌破誘空陷阱」",
+                        "2. <b>軋空行情 (Short Squeeze)</b>：空頭砸盤力量耗盡，逢低買盤與空頭止損引發快速反彈",
+                        "3. <b>大盤極短線洗盤</b>：遭遇大盤反向急拉，貫穿 -2.0% 風控防守線"
+                    ]
+                    reason_text = "\n".join([f"• {r}" for r in sl_reasons])
+
+                    loss_msg = f"""❌ <b>【單筆觸及止損告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🔴 主力開空</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+觸發止損價：<b>{format_price(last_price)} USDT</b> (-2.0%)
+
+🔍 <b>【止損觸發原因診斷】</b>
+{reason_text}
+
+⚠️ <i>已觸發 -2.0% 紀律止損，保護資金安全！請靜待下一次高勝率結構共振。</i>"""
+                    send_telegram_alert(loss_msg)
+
+                # TP3 檢測 (+4%)
+                elif last_price <= sig["tp3"] and sig["notified_tp"] < 3:
+                    sig["status"] = "WIN_TP3"
+                    sig["notified_tp"] = 3
+                    tp3_msg = f"""🚀 <b>【單筆 TP3 滿盈離場告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🔴 主力開空</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+4.0%)
+
+🎉 <i>已成功達標 TP3 (+4%)，恭喜滿盈離場獲利！</i>"""
+                    send_telegram_alert(tp3_msg)
+
+                # TP2 檢測 (+3%)
+                elif last_price <= sig["tp2"] and sig["notified_tp"] < 2:
+                    sig["status"] = "WIN_TP2"
+                    sig["notified_tp"] = 2
+                    tp2_msg = f"""🎯 <b>【單筆 TP2 達標告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🔴 主力開空</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+3.0%)
+
+💪 <i>已成功達標 TP2 (+3%)，獲利大幅擴展中！</i>"""
+                    send_telegram_alert(tp2_msg)
+
+                # TP1 檢測 (+2%)
+                elif last_price <= sig["tp1"] and sig["notified_tp"] < 1:
+                    sig["status"] = "WIN_TP1"
+                    sig["notified_tp"] = 1
+                    tp1_msg = f"""✅ <b>【單筆 TP1 達標告警】</b>
+
+📌 <b>標的</b>：<code>{symbol}</code> (永續合約)
+方向：<b>🔴 主力開空</b>
+進場價格：<b>{format_price(entry_price)} USDT</b>
+當前價格：<b>{format_price(last_price)} USDT</b> (+2.0%)
+
+💡 <i>已達標 TP1 (+2%)！建議平倉 50% 並將止損移至保本價！</i>"""
+                    send_telegram_alert(tp1_msg)
 
         except Exception:
             pass
@@ -280,13 +398,13 @@ def check_and_send_daily_backtest_report():
 • TP1 達標 (2%)：<b>{tp1_cnt} 筆</b> ({tp1_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
 • TP2 達標 (3%)：<b>{tp2_cnt} 筆</b> ({tp2_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
 • TP3 滿盈 (4%)：<b>{tp3_cnt} 筆</b> ({tp3_cnt/total_cnt*100 if total_cnt else 0:.1f}%)
-• SL 觸及止損 (-1.5%)：<b>{loss_cnt} 筆</b>
+• SL 觸及止損 (-2.0%)：<b>{loss_cnt} 筆</b>
 • 進行中 / 持倉：<b>{pending_cnt} 筆</b>
 
 🎯 <b>【實盤勝率評估】</b>
 • 策略勝率 (TP1 命中率)：<b>{win_rate:.1f}%</b> (目標 80%)
 
-💡 <i>嚴格執行 1.5% 止損與 2%/3%/4% 分段止盈，獲利期望值極高！</i>"""
+💡 <i>嚴格執行 2.0% 止損與 2%/3%/4% 分段止盈，即時播報每單進展與止損原因！</i>"""
 
         send_telegram_alert(msg)
         LAST_DAILY_BACKTEST_DATE = today_date_str
@@ -424,13 +542,13 @@ def inspect_symbol(ticker):
 
         reason_str = "\n".join([f"• {r}" for r in reasons])
 
-        # 【實盤精準風控：固定 1.5% 止損 | 2%、3%、4% 止盈】
-        sl_val = c0_close * 0.985 if is_bullish else c0_close * 1.015
+        # 【實盤精準風控：固定 2.0% 止損 | 2%、3%、4% 止盈】
+        sl_val = c0_close * 0.980 if is_bullish else c0_close * 1.020
         tp1_val = c0_close * 1.020 if is_bullish else c0_close * 0.980
         tp2_val = c0_close * 1.030 if is_bullish else c0_close * 0.970
         tp3_val = c0_close * 1.040 if is_bullish else c0_close * 0.960
 
-        # 將實盤訊號寫入自動覆盤
+        # 將實盤訊號寫入即時監控覆盤引擎
         TRACKED_SIGNALS.append({
             "symbol": symbol,
             "direction": direction_str,
@@ -440,7 +558,8 @@ def inspect_symbol(ticker):
             "tp2": tp2_val,
             "tp3": tp3_val,
             "created_at": now_time,
-            "status": "PENDING"
+            "status": "PENDING",
+            "notified_tp": 0
         })
 
         msg = f"""🚨 <b>【實盤第一拍 + 80% 勝率模組告警】</b>
@@ -462,12 +581,12 @@ def inspect_symbol(ticker):
 • FVG: {fvg_text} | OB: {ob_text} | 狀態: {snr_text}
 
 🛡️ <b>【實盤風控點位】</b>
-• <b>止損 (SL -1.5%)</b>：<code>{format_price(sl_val)}</code>
+• <b>止損 (SL -2.0%)</b>：<code>{format_price(sl_val)}</code>
 • <b>目標 1 (TP1 +2%)</b>：<code>{format_price(tp1_val)}</code> (保本平半倉)
 • <b>目標 2 (TP2 +3%)</b>：<code>{format_price(tp2_val)}</code>
 • <b>目標 3 (TP3 +4%)</b>：<code>{format_price(tp3_val)}</code> (滿盈離場)"""
 
-        print(f"🔥 [實盤訊號發送] {symbol} | OI: {oi_change_pct:+.2f}% | SL -1.5%")
+        print(f"🔥 [實盤訊號發送] {symbol} | OI: {oi_change_pct:+.2f}% | SL -2.0% 含原因診斷")
         send_telegram_alert(msg)
 
     except Exception:
@@ -476,7 +595,7 @@ def inspect_symbol(ticker):
 # ==================== 主監控循環 ====================
 def run_formal_hunter():
     threading.Thread(target=start_health_server, daemon=True).start()
-    print("⚡ 數據獵手 [實盤 1.5%SL 80%勝率版] 已啟動...")
+    print("⚡ 數據獵手 (止損原因診斷版) 已啟動...")
 
     while True:
         try:
