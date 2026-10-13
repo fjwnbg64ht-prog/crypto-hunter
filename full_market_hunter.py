@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "你的_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "你的_TELEGRAM_CHAT_ID")
 RISK_USD = 100.0  # 固定 $100 風控
 
-# 精簡為 4 大高流動性主流標的 (避免暴險過度分散)
+# 4 大高流動性主流標的
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
 ALERTED_SIGNALS = {}
@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "Market Hunter Clean & High-Performance Scanner is Running!"
+    return "Market Hunter tight entry range & structural SL/TP Scanner is Running!"
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -104,6 +104,28 @@ def calculate_indicators(df):
     df['avwap'] = anchor_df['avwap'].reindex(df.index).ffill()
     return df
 
+def find_structural_levels(df, curr_price, valid_support):
+    """尋找結構性 SL 止損位與 TP 止盈關鍵位"""
+    # 1. SL 結構止損：近 15 根 K 線的 Swing Low 低點
+    recent_swing_low = df['low'].tail(15).min()
+    sl_structural = min(recent_swing_low, valid_support) * 0.9995  # 留 0.05% 防防插針緩衝
+    
+    # 2. TP 結構關鍵高點阻力位
+    pivot_near = df['high'].tail(20).max()   # 近端結構前高 (TP1 參考)
+    pivot_mid = df['high'].tail(50).max()    # 中端波段高點 (TP2 參考)
+    pivot_far = df['high'].tail(100).max()   # 遠端強阻力頂部 (TP3 參考)
+    
+    risk_unit = curr_price - sl_structural
+    if risk_unit <= 0:
+        risk_unit = curr_price * 0.005  # 保底 0.5% 風險區間
+    
+    # 確保 TP 至少優於 1.2R, 1.8R, 2.5R，且精準鎖定結構前高位
+    tp1 = max(pivot_near, curr_price + risk_unit * 1.2)
+    tp2 = max(pivot_mid, curr_price + risk_unit * 1.8)
+    tp3 = max(pivot_far, curr_price + risk_unit * 2.5)
+    
+    return sl_structural, tp1, tp2, tp3, risk_unit
+
 def check_smc_snr_confluence(df, ob_tag, vol_ratio):
     """檢測 SMC (OB / FVG) 與 Key SnR 結構，標註 (+ / -) 符號"""
     curr = df.iloc[-1]
@@ -115,12 +137,12 @@ def check_smc_snr_confluence(df, ob_tag, vol_ratio):
     
     # 1. AVWAP 爆量機構持倉支撐
     confluences.append("🔥 爆量機構持倉 AVWAP 支撐 (+)")
-    reasons.append("價格回踩近 50 根最大成交量 K 線所拉出的機構持倉 AVWAP 成本線。")
+    reasons.append("價格精準回踩近 50 根爆量機構持倉 AVWAP 成本線。")
     
     # 2. 突破放量倍數
     if vol_ratio >= 1.2:
         confluences.append(f"💥 {vol_ratio:.1f}x 放量動能突破 (+)")
-        reasons.append(f"5m 突破 K 線成交量達到近 20 均量的 {vol_ratio:.1f} 倍，屬實體資金推動。")
+        reasons.append(f"5m 突破 K 線成交量達近 20 均量的 {vol_ratio:.1f} 倍，屬實體資金推動。")
     else:
         reasons.append("5m 結構性實體突破前高。")
         
@@ -154,7 +176,7 @@ def check_smc_snr_confluence(df, ob_tag, vol_ratio):
     return confluence_str, reason_str
 
 def scan_market():
-    print(f"🚀 【高精準 AVWAP + SMC/SnR 輕量獵手】已啟動！監控 {len(SYMBOLS)} 隻主流標的中...")
+    print(f"🚀 【高精準微型進場區間 + 結構 SL/TP 獵手】已啟動！監控 {len(SYMBOLS)} 隻標的中...")
     while True:
         try:
             for symbol in SYMBOLS:
@@ -173,7 +195,7 @@ def scan_market():
                 valid_support = min(ema21, avwap) if not np.isnan(avwap) else curr['close']
                 
                 # 策略進場條件
-                touch_support = (prev['low'] <= valid_support * 1.005) and (prev['close'] >= valid_support * 0.985)
+                touch_support = (prev['low'] <= valid_support * 1.003) and (prev['close'] >= valid_support * 0.988)
                 avwap_slope_ok = (avwap >= avwap_prev)
                 trend_filter = (curr['close'] > ema50) or (ema9 > ema21)
                 
@@ -190,39 +212,35 @@ def scan_market():
                         # 1. 抓取訂單簿深度 (Order Book Depth)
                         ob_tag, buyer_ratio = fetch_order_book_depth(symbol)
                         
-                        # 2. 計算進場區間
+                        # 2. 進場區間更緊密縮窄 (當前價 +0.05% 微型區間，嚴防追高)
                         entry_low = valid_support
-                        entry_high = curr['close'] * 1.0015
+                        entry_high = curr['close'] * 1.0005
                         
-                        # 3. 生成關鍵位驗證與進場理由分析
+                        # 3. 動態尋找 結構性止損 (SL) 與 結構性止盈 (TP)
+                        sl_price, tp1, tp2, tp3, risk_unit = find_structural_levels(df, curr['close'], valid_support)
+                        
+                        # 4. 生成關鍵位驗證與進場理由分析
                         smc_snr_tag, trade_reasons = check_smc_snr_confluence(df, ob_tag, vol_ratio)
                         
-                        sl_price = min(prev['low'], valid_support * 0.995)
-                        risk_per_unit = curr['close'] - sl_price
-                        
-                        if risk_per_unit > 0:
-                            qty = RISK_USD / risk_per_unit
+                        if risk_unit > 0:
+                            qty = RISK_USD / risk_unit
                             position_usd = qty * curr['close']
-                            tp1 = curr['close'] + (risk_per_unit * 1.5)
-                            tp2 = curr['close'] + (risk_per_unit * 2.0)
-                            tp3 = curr['close'] + (risk_per_unit * 3.0)
-                            
                             trade_id = f"TRADE-{int(time.time()) % 10000}"
                             
                             msg = (
                                 f"🎯 *【Martin 高精準進場訊號】* (`{trade_id}`)\n\n"
                                 f"📌 *標的*: `{symbol}` (5m)\n"
-                                f"🎯 *進場價格區間*: `{entry_low:.4f} ~ {entry_high:.4f}`\n"
-                                f"🛑 *止損價格*: `{sl_price:.4f}` (固定風控 $100)\n"
+                                f"🎯 *進場價格區間 (緊密)*: `{entry_low:.4f} ~ {entry_high:.4f}`\n"
+                                f"🛑 *結構止損價格*: `{sl_price:.4f}` (波段 Swing Low / 固定風控 $100)\n"
                                 f"📦 *建議手數*: `{qty:.2f}` (`{position_usd:.1f}` USDT)\n\n"
                                 f"💡 *進場理由與邏輯分析*:\n"
                                 f"  • {trade_reasons}\n\n"
                                 f"🔍 *關鍵位與盤口驗證 (+/-)*: \n"
                                 f"  • {smc_snr_tag}\n\n"
-                                f"📈 *止盈目標*:\n"
-                                f"  • TP1 (1:1.5): `{tp1:.4f}`\n"
-                                f"  • TP2 (1:2.0): `{tp2:.4f}`\n"
-                                f"  • TP3 (1:3.0): `{tp3:.4f}`\n\n"
+                                f"📈 *結構止盈目標*:\n"
+                                f"  • TP1 (近端 SnR 結構前高): `{tp1:.4f}`\n"
+                                f"  • TP2 (中端波段阻力高點): `{tp2:.4f}`\n"
+                                f"  • TP3 (遠端強阻力頂部位): `{tp3:.4f}`\n\n"
                                 f"⚠️ *紀律提醒*: 現價超出 `{entry_high:.4f}` **嚴格禁止追單**！"
                             )
                             send_telegram(msg)
